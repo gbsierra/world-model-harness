@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import importlib
 import json
+import os
 import subprocess
 from pathlib import Path
 from typing import cast
@@ -178,6 +179,17 @@ def test_examples_discovery_skips_unresolvable_names(tmp_path, monkeypatch) -> N
     assert "available: good-example" in unknown.output
 
 
+def test_main_entry_loads_dotenv_before_dispatch(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    # The persistence half of the wizard's credential flow: keys saved to .env must be back in
+    # os.environ on the next `wmh` invocation (main), and importing the module must NOT load.
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / ".env").write_text("WMH_TEST_MAIN_VAR=loaded\n", encoding="utf-8")
+    monkeypatch.delenv("WMH_TEST_MAIN_VAR", raising=False)
+    monkeypatch.setattr(cli_app_module, "app", lambda: None)
+    cli_app_module.main()
+    assert os.environ["WMH_TEST_MAIN_VAR"] == "loaded"
+
+
 def test_providers_subcommand_is_registered() -> None:
     group_names = {group.name for group in app.registered_groups}
     assert "providers" in group_names
@@ -338,8 +350,14 @@ def test_play_repl_steps_and_quits(patched_provider, tmp_path) -> None:  # noqa:
     assert "user u1 found" in result.output
 
 
-def test_build_interactive_wizard_creates_model(patched_provider, tmp_path) -> None:  # noqa: ANN001
+def test_build_interactive_wizard_creates_model(
+    patched_provider,  # noqa: ANN001 - pytest fixture
+    tmp_path,  # noqa: ANN001 - pytest fixture
+    monkeypatch,  # noqa: ANN001 - pytest fixture
+) -> None:
     root = tmp_path / ".wmh"
+    for var in ("AWS_REGION", "AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY"):
+        monkeypatch.setenv(var, "test-cred")  # creds present: no interactive key prompts
     # --interactive forces the wizard even under CliRunner (non-TTY); feed each answer line in
     # prompt order: name, file, provider (select), model (select), region (bedrock only), budget,
     # embedder (select). The offline 'hashing' embedder skips the embed-model prompt; phi dim isn't
@@ -348,7 +366,7 @@ def test_build_interactive_wizard_creates_model(patched_provider, tmp_path) -> N
         [
             "wizard-built",
             _traces_file(tmp_path),
-            "1",  # provider: bedrock
+            "3",  # provider: bedrock (order: openai, anthropic, bedrock, azure, ...)
             "1",  # model: us.anthropic.claude-opus-4-8
             "us-east-1",
             "4",  # gepa budget
