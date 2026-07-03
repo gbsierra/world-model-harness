@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import importlib
 import json
 import subprocess
 from pathlib import Path
@@ -12,6 +13,10 @@ from typer.testing import CliRunner
 
 from wmh.cli import app
 from wmh.providers.base import Completion, Message, ProviderConfig, ProviderKind, verify_via_ping
+
+# `wmh.cli`'s `app` attribute (the Typer object) shadows the `wmh.cli.app` submodule on
+# plain `import wmh.cli.app as ...`; go through importlib to monkeypatch module globals.
+cli_app_module = importlib.import_module("wmh.cli.app")
 
 runner = CliRunner()
 
@@ -131,6 +136,46 @@ def test_bare_invocation_shows_help(args: list[str]) -> None:
     # Bare invocation keeps the usage-error exit code (click >=8.2), unlike explicit --help
     # which exits 0 — scripts can still tell "asked for help" from "forgot the command".
     assert result.exit_code == 2
+
+
+def test_build_rejects_invalid_name_flag_with_friendly_error(tmp_path) -> None:  # noqa: ANN001
+    result = runner.invoke(
+        app,
+        ["build", "--name", "tau bench", "--file", _traces_file(tmp_path), "--no-interactive"],
+    )
+    assert result.exit_code == 2  # usage error, not a ValueError traceback
+    assert "invalid world model name" in result.output
+
+
+def test_examples_run_rejects_invalid_name_with_friendly_error() -> None:
+    result = runner.invoke(app, ["examples", "run", "tau bench"])
+    assert result.exit_code == 2  # usage error, not a ValueError traceback
+    assert "unknown example" in result.output
+
+
+def test_serve_rejects_invalid_name_with_friendly_error(tmp_path) -> None:  # noqa: ANN001
+    result = runner.invoke(app, ["serve", "--name", "tau bench", "--root", str(tmp_path / ".wmh")])
+    assert result.exit_code == 2  # usage error, not a ValueError traceback
+    assert "invalid world model name" in result.output
+
+
+def test_examples_discovery_skips_unresolvable_names(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    # A dir whose name validate_name rejects can never be run, so list (and the "available:"
+    # hint in the unknown-example error) must not advertise it.
+    for dirname in ("good-example", "tau bench"):
+        example = tmp_path / dirname
+        example.mkdir()
+        (example / "run.sh").write_text("#!/bin/sh\n", encoding="utf-8")
+    monkeypatch.setattr(cli_app_module, "_examples_root", lambda: tmp_path)
+
+    listed = runner.invoke(app, ["examples", "list"])
+    assert listed.exit_code == 0, listed.output
+    assert "good-example" in listed.output
+    assert "tau bench" not in listed.output
+
+    unknown = runner.invoke(app, ["examples", "run", "nope"])
+    assert unknown.exit_code == 2
+    assert "available: good-example" in unknown.output
 
 
 def test_providers_subcommand_is_registered() -> None:
