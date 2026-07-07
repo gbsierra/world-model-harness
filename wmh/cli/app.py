@@ -13,6 +13,7 @@ import logging
 import random
 import subprocess
 import time
+import urllib.error
 import uuid
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -21,9 +22,16 @@ from uuid import uuid4
 
 import typer
 import uvicorn
+from environment_capture.hub import (
+    CORPORA,
+    corpus_path,
+    fetch_corpus,
+    published_corpora,
+)
 from rich.console import Console
 from rich.markup import escape
 from rich.panel import Panel
+from rich.progress import BarColumn, DownloadColumn, Progress, TextColumn
 from rich.table import Table
 
 import wmh.providers as providers
@@ -36,6 +44,7 @@ from wmh.cli.ui import (
     run_build_wizard,
     run_play_repl,
     select_model,
+    select_option,
     select_provider_and_model,
 )
 from wmh.config import (
@@ -103,6 +112,9 @@ _CHECK = "[green]✓[/green]"
 _EVAL_TOKENS = typer.Argument(
     None,
     help="Trace files to score, or eval flow: list | run <suite> | results optional-suite.",
+)
+_DOWNLOAD_BENCHMARKS = typer.Argument(
+    None, help="Benchmark bundles to download, or 'all'. Omit for a picker."
 )
 
 
@@ -469,6 +481,81 @@ def list_models(root: str = typer.Option(ARTIFACT_DIR, help="Project dir to list
     _console.print(models_table(infos))
 
 
+@app.command("download")
+def download(
+    benchmarks: list[str] = _DOWNLOAD_BENCHMARKS,
+    force: bool = typer.Option(False, "--force", help="Overwrite existing local files."),
+) -> None:
+    """Download benchmark data bundles (trace corpus + task data) from the Hub.
+
+    With no arguments, lists the org's published datasets (live, via the Hub API) and offers a
+    picker. Bundles land in `packages/environment-capture/<benchmark>/`; existing local files
+    are kept unless `--force`.
+    """
+    selected = list(benchmarks or [])
+    if selected == ["all"]:
+        selected = sorted(CORPORA)
+    if not selected:
+        try:
+            published = published_corpora()
+        except urllib.error.URLError as exc:
+            raise typer.BadParameter(
+                f"could not list the Hub's published datasets ({exc.reason}); check the "
+                "connection, or pass benchmark names directly, e.g. `wmh download bird-sql`"
+            ) from exc
+        if not published:
+            raise typer.BadParameter(
+                "no published corpora found on the Hub; "
+                "pass benchmark names directly, e.g. `wmh download bird-sql`"
+            )
+        notes = {}
+        for corpus in published:
+            local = (corpus_path(corpus.benchmark)).exists()
+            state = "local copy present" if local else "not downloaded"
+            when = f", updated {corpus.last_modified}" if corpus.last_modified else ""
+            notes[corpus.benchmark] = f"{state}{when}"
+        choices = [corpus.benchmark for corpus in published]
+        picked = select_option(
+            _console, "Download which data bundle?", [*choices, "all"], notes=notes
+        )
+        selected = choices if picked == "all" else [picked]
+    for name in selected:
+        existing = corpus_path(name).exists()
+        try:
+            path = _fetch_with_progress(name, force=force)
+        except ValueError as exc:
+            raise typer.BadParameter(str(exc)) from exc
+        except urllib.error.HTTPError as exc:
+            raise typer.BadParameter(
+                f"{name}: the Hub answered {exc.code} for {exc.url}; the dataset may not be "
+                "published yet — `wmh download` with no arguments lists what is"
+            ) from exc
+        except urllib.error.URLError as exc:
+            raise typer.BadParameter(
+                f"{name}: could not reach the Hub ({exc.reason}); check the connection and re-run"
+                " — fetches resume file-by-file"
+            ) from exc
+        state = "kept local" if existing and not force else "fetched"
+        _console.print(f"{_CHECK} {state} [bold]{name}[/bold] -> {path}")
+
+
+def _fetch_with_progress(name: str, *, force: bool) -> Path:
+    """fetch_corpus with a live byte progress bar (hidden when nothing needs downloading)."""
+    with Progress(
+        TextColumn("[progress.description]{task.description}"),
+        BarColumn(),
+        DownloadColumn(),
+        console=_console,
+        transient=True,
+    ) as progress:
+        task_id = progress.add_task(f"downloading {name}", total=None, visible=False)
+
+        def on_progress(done: int, total: int) -> None:
+            progress.update(task_id, completed=done, total=total or None, visible=True)
+
+        return fetch_corpus(name, force=force, on_progress=on_progress)
+
+
 @app.command("serve")
 def serve(
     name: list[str] = typer.Option(  # noqa: B008 - typer reads option defaults at definition time
@@ -538,24 +625,28 @@ def eval_(  # noqa: A001 - `eval` is the user-facing command name; the builtin i
     - `wmh eval results optional-suite`: summarize local suite results.
     """
     args = tokens or []
-    suite_root = str(_examples_root()) if examples_root is None else examples_root
+    suite_roots = (
+        [str(root) for root in _benchmark_roots()]
+        if examples_root is None
+        else [examples_root]
+    )
     if args and args[0] == "list":
         if len(args) != 1:
             raise typer.BadParameter("usage: wmh eval list")
-        _eval_list(suite_root)
+        _eval_list(suite_roots)
         return
     if args and args[0] == "results":
         if len(args) > 2:
             raise typer.BadParameter("usage: wmh eval results [suite]")
         suite_filter = args[1] if len(args) == 2 else None
-        _eval_results(results_root, suite_root, suite_filter, limit=limit)
+        _eval_results(results_root, suite_roots, suite_filter, limit=limit)
         return
     if args and args[0] == "run":
         if len(args) != 2:
             raise typer.BadParameter("usage: wmh eval run <suite>")
         _eval_run_suite(
             args[1],
-            examples_root=suite_root,
+            examples_roots=suite_roots,
             results_root=results_root,
             prompt_file=prompt_file,
             provider=provider,
@@ -610,8 +701,8 @@ def eval_(  # noqa: A001 - `eval` is the user-facing command name; the builtin i
     )
 
 
-def _eval_list(examples_root: str) -> None:
-    suites = discover_eval_suites(examples_root)
+def _eval_list(examples_roots: list[str]) -> None:
+    suites = discover_eval_suites(examples_roots)
     if not suites:
         _console.print("[yellow]no eval suites found[/yellow]")
         return
@@ -634,7 +725,7 @@ def _eval_list(examples_root: str) -> None:
 
 def _eval_results(
     results_root: str,
-    examples_root: str,
+    examples_roots: list[str],
     suite_filter: str | None,
     *,
     limit: int,
@@ -642,7 +733,7 @@ def _eval_results(
     resolved_suite = suite_filter
     if suite_filter is not None:
         try:
-            resolved_suite = resolve_eval_suite(suite_filter, examples_root).id
+            resolved_suite = resolve_eval_suite(suite_filter, examples_roots).id
         except ValueError:
             resolved_suite = suite_filter
     summaries = list_eval_results(results_root, resolved_suite, limit=limit)
@@ -673,7 +764,7 @@ def _eval_results(
 def _eval_run_suite(
     selector: str,
     *,
-    examples_root: str,
+    examples_roots: list[str],
     results_root: str,
     prompt_file: str | None,
     provider: str,
@@ -688,7 +779,7 @@ def _eval_run_suite(
     top_k: int | None,
     out: str | None,
 ) -> None:
-    suite = resolve_eval_suite(selector, examples_root)
+    suite = resolve_eval_suite(selector, examples_roots)
     suite_prompt = suite.resolve_prompt()
     options = _eval_options(
         prompt_file=prompt_file or (str(suite_prompt) if suite_prompt is not None else None),
@@ -1094,22 +1185,25 @@ def _resolve_name(store: WorldModelStore, name: str | None) -> str:
         raise typer.BadParameter(str(exc)) from exc
 
 
-def _examples_root() -> Path:
-    """Repo-local examples directory."""
-    return Path(__file__).resolve().parents[2] / "examples"
+def _benchmark_roots() -> tuple[Path, ...]:
+    """Every root holding self-contained task dirs: examples/ + the capture member's data dirs."""
+    repo = Path(__file__).resolve().parents[2]
+    return (repo / "examples", repo / "packages" / "environment-capture")
 
 
 def _discover_examples() -> list[Path]:
-    root = _examples_root()
-    if not root.exists():
-        return []
-    return sorted(
-        path
-        for path in root.iterdir()
-        if path.is_dir()
-        and _is_safe_example_name(path.name)
-        and ((path / "traces.otel.jsonl").exists() or (path / "run.sh").exists())
-    )
+    found: list[Path] = []
+    for root in _benchmark_roots():
+        if not root.exists():
+            continue
+        found.extend(
+            path
+            for path in root.iterdir()
+            if path.is_dir()
+            and _is_safe_example_name(path.name)
+            and ((path / "traces.otel.jsonl").exists() or (path / "run.sh").exists())
+        )
+    return sorted(found)
 
 
 def _is_safe_example_name(name: str) -> bool:
@@ -1125,11 +1219,16 @@ def _resolve_example(name: str) -> Path:
     # An unsafe segment (spaces, path separators, ...) is simply not an example name; fall
     # through to the same "unknown example" usage error instead of a ValueError traceback.
     try:
-        example_dir = _examples_root() / validate_name(name)
+        safe = validate_name(name)
     except ValueError:
-        example_dir = None
-    if example_dir is not None and example_dir.is_dir():
-        return example_dir
+        safe = None
+    if safe is not None:
+        matches = [root / safe for root in _benchmark_roots() if (root / safe).is_dir()]
+        if len(matches) > 1:
+            found = ", ".join(str(path) for path in matches)
+            raise typer.BadParameter(f"example {name!r} exists in multiple roots: {found}")
+        if matches:
+            return matches[0]
     available = ", ".join(path.name for path in _discover_examples())
     hint = f" (available: {available})" if available else ""
     raise typer.BadParameter(f"unknown example {name!r}{hint}")
