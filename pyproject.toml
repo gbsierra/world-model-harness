@@ -76,6 +76,9 @@ environment-capture = { workspace = true }
 python_files = ["*_test.py"]
 # One root gate covers the flagship and every Python member (same inline-test convention).
 testpaths = ["wmh", "packages"]
+# tau2-bench is a local clone of the external real-environment runner (own test suite, own
+# deps) that lives beside the tau-bench member data; it is not part of this gate.
+norecursedirs = ["tau2-bench"]
 
 [tool.ruff]
 line-length = 100
@@ -90,7 +93,13 @@ extend-exclude = ["examples/", ".agents/",
 ]
 
 [tool.ruff.lint]
-select = ["E", "F", "I", "UP", "B", "ANN", "BLE"]
+select = ["E", "F", "I", "UP", "B", "ANN", "BLE", "T20"]
+
+[tool.ruff.lint.per-file-ignores]
+# The environment-capture member's benchmark capture/smoke/fetch scripts are operator-run CLIs
+# that report progress on stdout/stderr — that is their product output, same class as the
+# legacy dirs excluded above. The never-print rule (AGENTS.md § Python) binds `wmh/` in full.
+"packages/environment-capture/**" = ["T20"]
 
 [tool.ty.environment]
 python-version = "3.11"
