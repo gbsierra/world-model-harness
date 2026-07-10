@@ -26,6 +26,7 @@ from wmh.evals.gold import GoldJudge
 from wmh.evals.tasks import TaskSpec, load_tasks
 from wmh.harness.create import create_harness
 from wmh.harness.doc import HarnessDoc
+from wmh.harness.e2b_sandbox import E2B_TEMPLATE_ENV
 from wmh.harness.store import CHAMPION_ALIAS, HarnessStore
 from wmh.providers.base import Provider
 
@@ -100,7 +101,29 @@ def create(
         help="Optional JSONL held-out task file: accepted deltas must also be no worse here.",
     ),
     model: str = typer.Option(
-        None, "--model", help="World model to search against (default: the only built one)."
+        None,
+        "--model",
+        help="World model to search against (default: the only built one).",
+    ),
+    harness_backend: str = typer.Option(
+        "local",
+        "--harness-backend",
+        help="Where the harness PROCESS runs: local (in/from this process) or e2b (the real "
+        "pi agent inside pooled E2B sandboxes). The environment is always the world model.",
+    ),
+    eval_concurrency: int | None = typer.Option(
+        None,
+        "--eval-concurrency",
+        min=0,
+        help="(task, attempt) cells run at once per eval. Default: 1 for local; "
+        "0 (= all cells at once) for e2b.",
+    ),
+    e2b_template: str | None = typer.Option(
+        None,
+        "--e2b-template",
+        envvar=E2B_TEMPLATE_ENV,
+        help="Prebaked E2B sandbox template for --harness-backend e2b (default: "
+        "$WMH_E2B_TEMPLATE; without one, every sandbox bootstraps node + the pi runner deps).",
     ),
     seed: str = typer.Option(
         None,
@@ -118,10 +141,15 @@ def create(
     """Create a harness by inverting the world model: search harness-space against it.
 
     An LLM meta-agent proposes typed deltas against the harness document (surface-keyed ops with
-    preconditions), each applied child is scored closed-loop against the world model (k passes per
-    task) and gated on non-regression (regression suite, then full split, then the optional
-    held-out split). The champion is saved as a new immutable version with the `champion` alias.
-    Interactive at a TTY: missing inputs are prompted for.
+    preconditions), each applied child is scored closed-loop (k passes per task) and gated on
+    non-regression (regression suite, then full split, then the optional held-out split). The
+    environment is ALWAYS the world-model simulation; `--harness-backend` only picks where the
+    harness PROCESS runs: `local` (the default) keeps it in/from this process, `e2b` runs the
+    real pi agent inside pooled E2B sandboxes (pi-node seeds only), its tool calls still answered
+    by the world model host-side — all (task, attempt) cells in parallel unless
+    --eval-concurrency caps them. The champion is saved as a new immutable version with the
+    `champion` alias. Interactive at a TTY: missing inputs are prompted for (the backend stays
+    flag-only).
     """
     interactive = _console.is_terminal
     if name is None:
@@ -139,6 +167,10 @@ def create(
             else 5
         )
 
+    if harness_backend not in ("local", "e2b"):
+        raise typer.BadParameter(
+            f"unknown --harness-backend {harness_backend!r}; choose local or e2b"
+        )
     # Fail on a bad name NOW, not after the search has spent its eval budget on the save.
     try:
         validate_name(name)
@@ -148,14 +180,21 @@ def create(
     holdout = _load_task_file(holdout_file) if holdout_file else None
     store = HarnessStore(root)
     seed_doc = _resolve_seed(store, seed)
+    # The world model IS the environment on every backend, so it is always required.
     world_model, provider, model_name = _load_world_model(model, root)
 
     rollouts = (iterations + 1) * k * len(tasks)
     holdout_note = f" (+ up to {(iterations + 1) * k * len(holdout)} held-out)" if holdout else ""
+    backend_note = (
+        " (pi harness in pooled E2B sandboxes; env stays the world model)"
+        if harness_backend == "e2b"
+        else ""
+    )
     _console.print(
         f"searching from [bold]{seed_doc.name}[/bold] against world model "
         f"[bold]{model_name}[/bold]: {iterations} iteration(s), k={k}, {len(tasks)} task(s) "
         f"-> up to ~{rollouts} rollouts{holdout_note} + {iterations} proposal calls"
+        f"{backend_note}"
     )
     if interactive and not yes and not Confirm.ask("Proceed?", default=True):
         raise typer.Exit(0)
@@ -176,6 +215,9 @@ def create(
         iterations=iterations,
         k=k,
         holdout=holdout,
+        harness_backend="e2b" if harness_backend == "e2b" else "local",
+        eval_concurrency=eval_concurrency,
+        e2b_template=e2b_template,
         on_progress=_progress,
     )
     saved = store.save_version(result.best, alias=CHAMPION_ALIAS)
@@ -185,7 +227,10 @@ def create(
         f"success_rate={result.best_score:.3f}: {len(result.archive.deltas)} delta(s) audited, "
         f"{accepted} accepted, {result.skipped} skipped -> {store.dir_for(name)}"
     )
-    _console.print(f"  run it: [bold]wmh eval closed-loop {tasks_file} --harness {name}[/bold]")
+    backend_hint = " --harness-backend e2b" if harness_backend == "e2b" else ""
+    _console.print(
+        f"  run it: [bold]wmh eval closed-loop {tasks_file} --harness {name}{backend_hint}[/bold]"
+    )
     if archive_out:
         Path(archive_out).write_text(result.archive.model_dump_json(indent=2), encoding="utf-8")
         _console.print(f"  wrote archive -> {archive_out}")

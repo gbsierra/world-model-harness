@@ -27,6 +27,7 @@ import hashlib
 import os
 import re
 from enum import StrEnum
+from typing import TYPE_CHECKING
 
 from pydantic import BaseModel, Field, field_validator, model_validator
 
@@ -39,6 +40,11 @@ from wmh.harness.runtime import DEFAULT_MAX_TURNS, DEFAULT_SYSTEM_PROMPT, AgentR
 from wmh.harness.skills import Skill, SkillLibrary
 from wmh.harness.tools import DEFAULT_TOOLS, render_tools, resolve_tools
 from wmh.providers.base import Provider
+
+if TYPE_CHECKING:
+    # Import-time neutral: pi_e2b (the optional e2b extra's consumer) is imported lazily inside
+    # runtime(); this name exists only for the e2b_pool annotation.
+    from wmh.harness.pi_e2b import E2BSandboxPool
 
 _SLUG_RE = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
 
@@ -221,21 +227,49 @@ class HarnessDoc(BaseModel):
         """The vendored code surfaces (those carrying a file path), in id order."""
         return [s for s in self.surfaces if s.kind is SurfaceKind.CODE and s.path is not None]
 
-    def runtime(self, provider: Provider, *, backend: str = "local") -> Runtime:
+    def runtime(
+        self,
+        provider: Provider,
+        *,
+        backend: str = "local",
+        e2b_template: str | None = None,
+        e2b_pool: E2BSandboxPool | None = None,
+    ) -> Runtime:
         """The configured agent runtime this document describes.
 
-        `backend` chooses WHERE the harness executes; only `local` (this process) is built in here.
-        `param:runtime-kind` = "pi-node" dispatches the vendored-pi runner (over the SSH shim, or
-        the RunnerLink frame transport when PI_TRANSPORT=link). Otherwise a `code:runtime` surface
-        drives episodes with the harness's own in-process program; with neither, the fixed baseline
-        loop runs. All expose the same `run(task_id, instruction, environment) -> RunResult` shape
-        closed-loop eval drives.
+        `backend` chooses WHERE the harness process executes; the ENVIRONMENT its tool calls hit
+        is whatever `AgentEnvironment` the eval binds (normally the world-model simulation),
+        regardless of backend. `local` runs in/from this process. `e2b` runs the harness process
+        in E2B sandboxes the runtime owns — only meaningful for `param:runtime-kind` = "pi-node"
+        (the vendored pi agent, whose real context management is the point of running it); any
+        other kind raises, because its loop already runs in-process and "e2b" would silently mean
+        nothing. `e2b_template` names a prebaked sandbox template whose bootstrap (node 22 + pi's
+        npm deps) is already done; default is $WMH_E2B_TEMPLATE. Under `local`, "pi-node" uses
+        the SSH shim (or the RunnerLink frame transport when PI_TRANSPORT=link); otherwise a
+        `code:runtime` surface drives episodes with the harness's own in-process program; with
+        neither, the fixed baseline loop runs. All expose the same
+        `run(task_id, instruction, environment) -> RunResult` shape closed-loop eval drives.
         """
-        if backend != "local":
-            raise ValueError(f"unknown backend {backend!r}; choose local")
+        if backend not in ("local", "e2b"):
+            raise ValueError(f"unknown backend {backend!r}; choose local or e2b")
         if self.runtime_kind() == "pi-node":
             skills = SkillLibrary(self.skills())
             code_files = {s.path: s.content for s in self.code_files() if s.path is not None}
+            if backend == "e2b":
+                # Lazy: the e2b backend is an optional extra; `local` must import none of it.
+                from wmh.harness.pi_e2b import E2BPiRuntime
+                from wmh.harness.runner_link import worker_config_for
+
+                return E2BPiRuntime(
+                    # Explicit PI_AGENT_* env wins; else a Bedrock `provider` is derived so the
+                    # worker LLM is the agent model the caller already chose (hosted platform).
+                    worker=worker_config_for(provider.config),
+                    files=code_files,
+                    tools=resolve_tools(self.tools()),
+                    system_prompt=self._assembled_prompt(skills),
+                    template=e2b_template,
+                    pool=e2b_pool,
+                )
             # PI_TRANSPORT=link routes pi to the RunnerLink frame transport (a persistent runner the
             # host set via runner_link.set_active_channel) instead of the per-episode SSH shim; the
             # default (unset / "ssh") keeps PiRuntime. The worker LLM reads the same PI_AGENT_* env.
@@ -268,6 +302,12 @@ class HarnessDoc(BaseModel):
                 temperature=self.temperature(),
                 skills=skills,
                 system_prompt=self._assembled_prompt(skills),
+            )
+        if backend == "e2b":
+            raise ValueError(
+                f"backend='e2b' runs the pi-node harness process in a sandbox; this harness's "
+                f"runtime kind is {self.runtime_kind()!r}, which already runs in-process — "
+                "use backend='local'"
             )
         code = self.surface(CODE_RUNTIME_ID)
         skills = SkillLibrary(self.skills())

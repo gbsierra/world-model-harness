@@ -38,11 +38,16 @@ dependencies = [
 otel = ["opentelemetry-proto>=1.24"]
 # Plotting/figures for research runs; kept out of the core install.
 viz = ["seaborn>=0.13", "matplotlib>=3.8"]
+# The e2b harness backend (`--harness-backend e2b`): the pi-node harness PROCESS executes in
+# pooled E2B microVMs while the environment stays the world model. Only those runs need it —
+# local runs stay sandbox-free — so it is an optional extra imported lazily
+# (wmh.harness.e2b_sandbox / wmh.harness.pi_e2b).
+e2b = ["e2b>=2.0"]
 dev = [
     "pytest>=8.0",
     "ruff>=0.5",
     "ty>=0.0.1a1",
-    "world-model-harness[otel,viz]",
+    "world-model-harness[otel,viz,e2b]",
 ]
 
 [dependency-groups]

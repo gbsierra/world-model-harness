@@ -28,8 +28,9 @@ from typing import Any, Protocol, cast
 
 from wmh.core.types import Action, ActionKind, EnvState, JsonObject, Observation, Step
 from wmh.harness.environment import AgentEnvironment, is_env_action
-from wmh.harness.runtime import RunResult, StopReason
+from wmh.harness.runtime import RunResult, StopReason, TokenUsage
 from wmh.harness.tools import ToolSpec
+from wmh.providers.base import ProviderConfig, ProviderKind
 
 DEFAULT_MAX_ENV_ACTIONS = 40
 
@@ -104,6 +105,15 @@ class WorkerConfig:
     key_env: str = ""
 
 
+_PI_AGENT_ENV_VARS = (
+    "PI_AGENT_BACKEND",
+    "PI_AGENT_MODEL",
+    "PI_AGENT_REGION",
+    "PI_AGENT_BASE_URL",
+    "PI_AGENT_KEY_ENV",
+)
+
+
 def worker_config_from_env() -> WorkerConfig:
     """Build the worker config from the same PI_AGENT_* env knobs PiRuntime reads.
 
@@ -119,6 +129,27 @@ def worker_config_from_env() -> WorkerConfig:
         base_url=os.environ.get("PI_AGENT_BASE_URL", "https://api.deepseek.com/v1"),
         key_env=os.environ.get("PI_AGENT_KEY_ENV", "DEEPSEEK_API_KEY"),
     )
+
+
+def worker_config_for(config: ProviderConfig) -> WorkerConfig:
+    """The worker config for an eval, preferring explicit env over provider derivation.
+
+    Precedence: any PI_AGENT_* env var set -> `worker_config_from_env` exactly as before (the
+    operator asked for a specific worker). Otherwise, a Bedrock agent provider is fully derivable
+    (model id + region; AWS creds stay host-side as always) — this is what lets the hosted
+    platform point pi at the agent's catalog model with zero env plumbing. Any other kind keeps
+    the env defaults: their auth shapes (Azure api-version query strings, deployment paths) do
+    not fit the single openai-completions POST `worker_completion` sends.
+    """
+    if any(os.environ.get(name) for name in _PI_AGENT_ENV_VARS):
+        return worker_config_from_env()
+    if config.kind is ProviderKind.BEDROCK and config.model:
+        return WorkerConfig(
+            backend="bedrock",
+            model=config.model,
+            region=config.region or os.environ.get("AWS_REGION", "us-east-1"),
+        )
+    return worker_config_from_env()
 
 
 # The process-wide runner channel doc.runtime(PI_TRANSPORT=link) drives. A search/eval sets it once
@@ -147,13 +178,30 @@ def worker_completion(body: JsonObject, cfg: WorkerConfig) -> JsonObject:
     return _openai_completion(body, cfg)
 
 
-def _openai_completion(body: JsonObject, cfg: WorkerConfig) -> JsonObject:
-    import urllib.request
+def _normalized_openai_body(body: JsonObject, cfg: WorkerConfig) -> JsonObject:
+    """The runner's request body rewritten for a single non-streaming worker call.
 
+    The runner's pi client asks for a stream (`stream: true` + `stream_options`), but the frame
+    transport carries exactly one finished completion, so the request must be non-streaming —
+    and strict OpenAI-compatible servers (DeepSeek) 400 on `stream_options` without
+    `stream=true`. `max_completion_tokens` is translated to the widely supported `max_tokens`.
+    """
     b = dict(body)
     if cfg.model:
         b["model"] = cfg.model
     b["stream"] = False
+    b.pop("stream_options", None)
+    # Always removed — strict backends 400 on the field itself; an explicit max_tokens wins.
+    max_completion = b.pop("max_completion_tokens", None)
+    if max_completion is not None and "max_tokens" not in b:
+        b["max_tokens"] = max_completion
+    return b
+
+
+def _openai_completion(body: JsonObject, cfg: WorkerConfig) -> JsonObject:
+    import urllib.request
+
+    b = _normalized_openai_body(body, cfg)
     key = os.environ.get(cfg.key_env, "") if cfg.key_env else ""
     req = urllib.request.Request(
         cfg.base_url.rstrip("/") + "/chat/completions",
@@ -297,11 +345,19 @@ def bedrock_to_completion(resp: JsonObject) -> JsonObject:
         "content_filtered": "content_filter",
         "guardrail_intervened": "content_filter",
     }.get(stop, "stop")
-    return {
+    completion: JsonObject = {
         "id": "chatcmpl-runnerlink",
         "object": "chat.completion",
         "choices": [{"index": 0, "message": msg, "finish_reason": finish}],
     }
+    usage = cast("Any", resp).get("usage", {})
+    if usage:
+        # OpenAI usage shape, so worker-token accounting reads one format on every backend.
+        completion["usage"] = {
+            "prompt_tokens": int(usage.get("inputTokens", 0)),
+            "completion_tokens": int(usage.get("outputTokens", 0)),
+        }
+    return completion
 
 
 def params_schema(tool: ToolSpec) -> JsonObject:
@@ -416,13 +472,16 @@ class RunnerLink:
                 "max_env_actions": self._max_env_actions,
             }
         )
+        usage = TokenUsage()
         while True:
             frame = self._channel.recv()
             if frame is None:  # channel closed before the episode finished
-                return self._error_result(task_id, episode, instruction, "runner channel closed")
+                return self._error_result(
+                    task_id, episode, instruction, "runner channel closed", usage=usage
+                )
             kind = frame.get("type")
             if kind == "llm_request":
-                self._answer_llm(episode_id, frame)
+                self._answer_llm(episode_id, frame, usage)
             elif kind == "tool_request":
                 name = frame.get("name")
                 args = frame.get("arguments")
@@ -447,19 +506,33 @@ class RunnerLink:
                     stop_reason=StopReason.SUBMITTED,
                     answer=episode.answer,
                     turns=len(episode.steps),
+                    worker_usage=usage if usage.calls else None,
                 )
             elif kind == "episode_error":
                 note = frame.get("note")
                 return self._error_result(
-                    task_id, episode, instruction, note if isinstance(note, str) else "runner error"
+                    task_id,
+                    episode,
+                    instruction,
+                    note if isinstance(note, str) else "runner error",
+                    usage=usage,
                 )
             # unknown frame types are ignored (forward-compatible)
 
-    def _answer_llm(self, episode_id: str, frame: JsonObject) -> None:
+    def _answer_llm(self, episode_id: str, frame: JsonObject, usage: TokenUsage) -> None:
         req_id = frame.get("req_id")
         body = frame.get("openai_body")
         try:
             completion = self._worker_fn(body if isinstance(body, dict) else {})
+            # Meter the worker leg host-side: these calls bypass the Provider abstraction, so
+            # the completion's usage block is the only spend record (failed calls cost nothing).
+            usage.calls += 1
+            reported = completion.get("usage")
+            if isinstance(reported, dict):
+                prompt = reported.get("prompt_tokens")
+                out = reported.get("completion_tokens")
+                usage.input_tokens += prompt if isinstance(prompt, int) else 0
+                usage.output_tokens += out if isinstance(out, int) else 0
             self._channel.send(
                 {
                     "type": "llm_response",
@@ -479,7 +552,14 @@ class RunnerLink:
             )
 
     @staticmethod
-    def _error_result(task_id: str, episode: HostEpisode, instruction: str, note: str) -> RunResult:
+    def _error_result(
+        task_id: str,
+        episode: HostEpisode,
+        instruction: str,
+        note: str,
+        *,
+        usage: TokenUsage | None = None,
+    ) -> RunResult:
         stop = StopReason.MAX_TURNS if episode.steps else StopReason.ERROR
         episode.steps.append(
             Step(
@@ -495,4 +575,5 @@ class RunnerLink:
             stop_reason=stop,
             answer="",
             turns=len(episode.steps),
+            worker_usage=usage if usage is not None and usage.calls else None,
         )
