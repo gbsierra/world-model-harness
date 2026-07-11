@@ -6,11 +6,14 @@ api_version come from ProviderConfig.deployment / ProviderConfig.api_version.
 
 from __future__ import annotations
 
+import os
 from typing import TYPE_CHECKING
 
 from wmh.providers import _openai_common
 from wmh.providers.base import (
     DEFAULT_MAX_TOKENS,
+    ChatRequest,
+    ChatResponse,
     Completion,
     Message,
     ProviderConfig,
@@ -65,6 +68,15 @@ class AzureOpenAIProvider:
             self._get_client().chat.completions, self._deployment(), system, messages, max_tokens
         )
 
+    def complete_chat(self, request: ChatRequest) -> ChatResponse:
+        """Run a full structured request on the configured Azure deployment."""
+        return _openai_common.complete_chat(
+            self._get_client().chat.completions,
+            self._deployment(),
+            request,
+            max_tokens_field=self.config.chat_max_tokens_field,
+        )
+
     def embed(self, texts: list[str]) -> list[list[float]]:
         # As with `model` in complete(), `embed_model` must be the Azure *deployment* name of an
         # embedding model, not a base OpenAI model id, or the call 404s.
@@ -79,7 +91,6 @@ class AzureOpenAIProvider:
 
 
 def _require_endpoint() -> str:
-    import os
 
     endpoint = os.environ.get("AZURE_OPENAI_ENDPOINT")
     if not endpoint:
