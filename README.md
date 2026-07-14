@@ -59,6 +59,39 @@ print(obs.content)
 
 Or over HTTP (same code path), namespaced by model name: `GET /world_models`, then `POST /world_models/{name}/sessions` and `POST /world_models/{name}/sessions/{id}/step`.
 
+## Run after platform login
+
+`wmh run` is the single interactive execution command. After `wmh login`, an opaque platform id
+is resolved automatically: a world-model id opens a hosted model session, while an agent id runs
+that agent's champion pi harness in the platform's E2B sandbox. No local files are uploaded by
+default. Add `-u PATH` (or `--upload-dir PATH`) to upload that directory as the E2B workspace,
+live-sync changes, and automatically sync final regular-file changes back. Concurrent local edits
+are preserved and the full E2B result is saved under `.wmh-conflicts/` for manual recovery.
+Provider and E2B credentials remain platform-side, so no API keys are needed locally.
+
+```bash
+wmh login
+wmh run <world-model-or-agent-id>
+wmh run <agent-id> -u . --task "fix the failing tests"
+wmh run --task "fix the failing tests"   # built-in pi harness, also platform-backed when logged in
+```
+
+For a deployment-protected preview whose public discovery route is not available to a
+non-browser client, pair its browser and backend URLs explicitly:
+
+```bash
+wmh login --url https://preview.example --api-url https://preview-api.example
+```
+
+Workspace transport skips symlinks, VCS internals, virtual environments, dependency trees, and
+common caches. Uploads are capped at 50 MiB compressed and 512 MiB unpacked.
+
+The bare built-in pi path runs locally and requires Node.js 22.19 or newer plus npm on `PATH`. WMH
+installs the pinned pi npm dependencies into its user cache on the first run. Harness code and
+shell commands run with your normal user permissions: file tools are restricted to `--dir`, but
+bash is not OS-sandboxed. The CLI states this boundary before the local pi process starts. A
+logged-out bare `wmh run` remains available with local provider environment credentials.
+
 ## Real agents in E2B sandboxes
 
 Harness evals normally drive a plain in-process agent loop. With `--harness-backend e2b`, a
