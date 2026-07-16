@@ -76,6 +76,35 @@ wmh run <agent-id> -u . --task "fix the failing tests"
 wmh run --task "fix the failing tests"   # built-in pi harness, also platform-backed when logged in
 ```
 
+Hosted agent sessions can also run detached: start one, return to your shell, and keep working
+with it from later commands (or from the web app, where it remains an ordinary live session):
+
+```bash
+wmh run <agent-id> -d                    # start hosted, remember as the current session, return
+wmh run <agent-id> -u . --detach         # same, with workspace upload + live sync
+wmh run -s "Do this task"                # send a message, stream that turn until idle, exit
+wmh run -a                               # attach interactively; :detach leaves it running
+wmh run --end                            # end it explicitly, with the final workspace sync
+wmh run --session <session-id> --send "Do this task"   # address a specific session
+```
+
+An interactive `wmh run <agent-id>` can also be promoted mid-session: type `:detach` to leave
+the hosted session running as the current detached session (with `-u`, the sync checkpoint is
+carried over), then continue with `-s`/`-a`/`--end` as above.
+
+The current-session reference (and, with `-u`, a synchronization checkpoint) lives in WMH user
+state under `~/.wmh/sessions/`, not in your repository. Every send/attach/end first catches up:
+workspace changes the agent made while nothing was attached are applied locally, and local edits
+made since the checkpoint are uploaded, before the command proceeds. In a detached-started or
+attached session (`-a`), leaving never ends the run: `:detach`, Ctrl-D, and a second Ctrl-C all
+leave it alive, and only `wmh run --end` or the interactive `:end` command terminates it. A
+plain interactive `wmh run <agent-id>` keeps its original semantics: `:quit`, `:end`, Ctrl-D,
+and a double Ctrl-C end the session, while `:detach` promotes it. Lines starting with a colon
+are reserved for commands and are never sent to the agent as chat. Detached sessions still
+observe the platform's idle timeout: an idle session eventually ends on its own, and the next
+`wmh run --end` reconciles its final workspace (even when the local checkpoint or directory is
+gone, in which case the final archive is saved as a recovery file instead of synced).
+
 For a deployment-protected preview whose public discovery route is not available to a
 non-browser client, pair its browser and backend URLs explicitly:
 

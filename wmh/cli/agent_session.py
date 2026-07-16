@@ -28,6 +28,7 @@ import subprocess
 import sys
 import threading
 import time
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Annotated, Protocol
 
@@ -35,13 +36,23 @@ import typer
 from rich.console import Console
 from rich.panel import Panel
 
+from wmh.cli.hosted_session import (
+    DetachedCommandDriver,
+    DetachedStartDriver,
+    LiveWorkspace,
+    SessionAction,
+    patch_revision,
+)
+from wmh.cli.session_state import (
+    DetachedSessionState,
+    SessionStateError,
+    SessionStateStore,
+    WorkspaceCheckpoint,
+)
 from wmh.cli.workspace_sync import (
     WorkspaceSnapshot,
     WorkspaceSyncError,
-    apply_workspace_patch,
     snapshot_workspace,
-    sync_workspace,
-    write_conflict_archive,
 )
 from wmh.engine.play import parse_action
 from wmh.harness.doc import RUNTIME_KIND_ID, HarnessDoc, Surface, SurfaceKind
@@ -50,9 +61,9 @@ from wmh.harness.pi_local import LocalStdioChannel, start_local_live_runner
 from wmh.harness.pi_vendor import pi_agent_code_surfaces
 from wmh.harness.skills import SkillLibrary
 from wmh.harness.tools import render_tools, resolve_tools
-from wmh.harness.workspace_patch import WorkspacePatchError, build_workspace_patch
+from wmh.harness.workspace_patch import WorkspacePatchError
 from wmh.platform.client import PlatformClient, PlatformError, RemoteAgentSession
-from wmh.platform.credentials import load_credentials
+from wmh.platform.credentials import PlatformCredentials, load_credentials
 from wmh.providers.base import ProviderConfig, ProviderKind, ToolCallingProvider
 from wmh.providers.models import resolve_provider_model
 from wmh.providers.registry import get_provider
@@ -439,27 +450,50 @@ class RemoteAgentCommandReader(threading.Thread):
         self._agent_id = agent_id
         self._session_id = session_id
         self.eof = threading.Event()
+        self.detach = threading.Event()
 
     def run(self) -> None:
-        """Map stdin lines to hosted steer, interrupt, and end commands."""
+        """Map stdin lines to hosted steer, interrupt, detach, and end commands."""
         try:
             for raw in sys.stdin:
                 line = raw.strip()
-                if line in {":quit", ":q", ":exit"}:
-                    self._post("end")
+                if line in {":quit", ":q", ":exit", ":end"}:
+                    if self._post("end"):
+                        return
+                elif line == ":detach":
+                    self.detach.set()
                     return
-                if line == ":stop":
+                elif line == ":stop":
                     self._post("interrupt")
+                elif line.startswith(":"):
+                    # An unknown command must never reach the agent as chat.
+                    _console.print(
+                        f"[yellow]unknown command {line}; use :stop, :detach, or :quit[/yellow]"
+                    )
                 elif line:
                     self._post("user_message", text=line)
-        except (OSError, PlatformError):
+        except OSError:
             pass
         finally:
-            self.eof.set()
+            # EOF keeps its plain-run meaning (end once the run settles); a
+            # detach stopped reading deliberately and must not look like EOF.
+            if not self.detach.is_set():
+                self.eof.set()
 
-    def _post(self, kind: str, *, text: str | None = None) -> None:
-        """Post one command through the authenticated platform client."""
-        self._client.post_agent_session_command(self._agent_id, self._session_id, kind, text=text)
+    def _post(self, kind: str, *, text: str | None = None) -> bool:
+        """Post one command; a transient failure warns and keeps the reader alive.
+
+        Returns:
+            Whether the command was accepted.
+        """
+        try:
+            self._client.post_agent_session_command(
+                self._agent_id, self._session_id, kind, text=text
+            )
+        except PlatformError as error:
+            _console.print(f"[red]{kind} failed:[/red] {error} (still attached; try again)")
+            return False
+        return True
 
 
 class RemoteAgentDriver:
@@ -472,15 +506,20 @@ class RemoteAgentDriver:
         name: str,
         jail_root: Path | None,
         task: str | None,
+        *,
+        credentials: PlatformCredentials,
+        state_store: SessionStateStore,
     ) -> None:
-        """Store the resolved agent and optional local workspace transport root."""
+        """Store the resolved agent, workspace root, and detach-promotion state."""
         self._client = client
         self._target_id = target_id
         self._name = name
         self._jail = jail_root
         self._task = task
+        self._credentials = credentials
+        self._store = state_store
         self._interrupts = 0
-        self._live_conflicts: set[str] = set()
+        self._cursor = 0
 
     def run(self) -> None:
         """Run and stream one E2B session, syncing local files only when requested."""
@@ -498,63 +537,101 @@ class RemoteAgentDriver:
                 workspace=initial.archive if initial is not None else None,
                 instruction=self._task,
             )
+            workspace: LiveWorkspace | None = None
+            if self._jail is not None and initial is not None:
+                workspace = LiveWorkspace(
+                    self._client, self._target_id, session.id, self._jail, initial
+                )
             quit_detail = "end and sync back" if initial is not None else "end"
             _console.print(
                 f"[green]E2B session started[/green] for [bold]{self._name}[/bold]. "
-                "Type to steer, [bold]:stop[/bold] to interrupt, "
-                f"[bold]:quit[/bold] to {quit_detail}."
+                "Type to steer, [bold]:stop[/bold] to interrupt, [bold]:detach[/bold] to "
+                f"leave it running, [bold]:quit[/bold] to {quit_detail}."
             )
             reader = RemoteAgentCommandReader(self._client, self._target_id, session.id)
             reader.start()
             stdin_eof = getattr(reader, "eof", threading.Event())
-            terminal, synchronized = self._poll(session.id, initial, stdin_eof)
-            jail_root = self._jail
+            detach = getattr(reader, "detach", threading.Event())
+            terminal = self._poll(session.id, workspace, stdin_eof, detach)
+            if terminal is None:
+                self._promote(session.id, workspace)
+                return
             workspace_conflicts = False
-            if jail_root is not None and synchronized is not None:
-                with _console.status("[dim]syncing E2B workspace back...[/dim]", spinner="dots"):
-                    final_archive = self._client.download_agent_workspace(
-                        self._target_id, session.id
-                    )
-                    result = sync_workspace(
-                        jail_root,
-                        synchronized,
-                        final_archive,
-                        protected_paths=frozenset(self._live_conflicts),
-                    )
-                if result.conflicts:
-                    workspace_conflicts = True
-                    recovery = write_conflict_archive(jail_root, session.id, final_archive)
-                    self._client.acknowledge_agent_workspace(self._target_id, session.id)
-                    paths = ", ".join(result.conflicts)
-                    _console.print(
-                        f"[red]workspace conflicts preserved locally[/red]: {paths}\n"
-                        f"The full E2B result is saved at [bold]{recovery}[/bold]."
-                    )
-                else:
-                    self._client.acknowledge_agent_workspace(self._target_id, session.id)
-                    _console.print(
-                        f"[green]workspace synced[/green] ({len(result.applied)} changed paths)"
-                    )
+            if workspace is not None:
+                workspace_conflicts = bool(workspace.finalize().conflicts)
             if terminal.status == "failed":
                 _console.print(f"[red]session failed: {terminal.error or 'unknown error'}[/red]")
                 raise typer.Exit(code=1)
             if workspace_conflicts:
                 raise typer.Exit(code=2)
-        except (WorkspacePatchError, WorkspaceSyncError) as error:
+        except (WorkspacePatchError, WorkspaceSyncError, SessionStateError) as error:
             raise typer.BadParameter(str(error)) from error
         except PlatformError as error:
             raise typer.BadParameter(str(error)) from error
         finally:
             self._client.close()
 
+    def _advance_cursor(self, seq: int) -> None:
+        """Mark one transcript event as processed."""
+        self._cursor = seq
+
+    def _promote(self, session_id: str, workspace: LiveWorkspace | None) -> None:
+        """Persist the live session as the current detached session and exit.
+
+        The transcript cursor and (with -u) the last synchronized snapshot are
+        checkpointed exactly as a `--detach` start would have left them, so the
+        next send/attach/end catches up from here. No final workspace sync
+        runs: the session stays alive.
+        """
+        checkpoint: WorkspaceCheckpoint | None = None
+        base_archive: bytes | None = None
+        if workspace is not None and self._jail is not None:
+            checkpoint = WorkspaceCheckpoint(
+                root=str(self._jail), conflicts=tuple(sorted(workspace.conflicts))
+            )
+            base_archive = workspace.synchronized.archive
+        state = DetachedSessionState(
+            api_url=str(self._credentials.api_url),
+            web_url=self._credentials.web_url,
+            agent_id=self._target_id,
+            agent_name=self._name,
+            session_id=session_id,
+            created_at=datetime.now(tz=UTC).isoformat(),
+            cursor=self._cursor,
+            workspace=checkpoint,
+        )
+        try:
+            self._store.save(state, base_archive=base_archive)
+            self._store.set_current(session_id)
+        except SessionStateError as error:
+            # The hosted session keeps running; the user must get an
+            # addressable reference even though the local save failed.
+            msg = (
+                f"session {session_id} is still running on the platform, but its local "
+                f"reference could not be saved: {error}. Control it with "
+                f"`wmh run --session {session_id} --attach` or end it with "
+                f"`wmh run --session {session_id} --end`"
+            )
+            raise typer.BadParameter(msg) from error
+        _console.print(
+            f"[green]detached[/green]; session {session_id} stays alive as the "
+            "current session.\n"
+            'Send a message with [bold]wmh run -s "..."[/bold], attach with '
+            "[bold]wmh run -a[/bold], end with [bold]wmh run --end[/bold]."
+        )
+
     def _poll(
         self,
         session_id: str,
-        synchronized: WorkspaceSnapshot | None,
+        workspace: LiveWorkspace | None,
         stdin_eof: threading.Event,
-    ) -> tuple[RemoteAgentSession, WorkspaceSnapshot | None]:
-        """Render new transcript events until output export makes the row terminal."""
-        cursor = 0
+        detach: threading.Event,
+    ) -> RemoteAgentSession | None:
+        """Render transcript events until the row is terminal or the user detaches.
+
+        Returns:
+            The terminal session record, or ``None`` when the user detached.
+        """
         last_workspace_push = time.monotonic()
         sink = TerminalEventSink(recorder=None, on_running=lambda _running: None)
         saw_running = False
@@ -562,15 +639,21 @@ class RemoteAgentDriver:
         while True:
             try:
                 page = self._client.list_agent_session_events(
-                    self._target_id, session_id, after=cursor
+                    self._target_id, session_id, after=self._cursor
                 )
                 for event in page.events:
                     if event.kind == "workspace_patch":
-                        if synchronized is None:
+                        if workspace is None:
                             raise WorkspaceSyncError(
                                 "received a workspace patch without --upload-dir"
                             )
-                        synchronized = self._apply_remote_patch(session_id, event, synchronized)
+                        # Advance before the ack posts: once the object is
+                        # acknowledged (hence deleted), neither an interrupt
+                        # resume nor a :detach promotion may re-request it.
+                        workspace.apply_remote_patch(
+                            patch_revision(event),
+                            before_ack=lambda seq=event.seq: self._advance_cursor(seq),
+                        )
                     elif event.kind == "status":
                         detail = event.payload.get("message") or event.payload.get("status")
                         if detail:
@@ -590,81 +673,41 @@ class RemoteAgentDriver:
                                     self._target_id, session_id, "end"
                                 )
                                 end_sent = True
-                cursor = page.last_seq
+                    # Per event, not per page: a Ctrl-C mid-page must resume
+                    # (and promote) after the events already processed.
+                    self._cursor = event.seq
+                self._cursor = page.last_seq
                 if page.status in {"ended", "failed"}:
-                    return (
-                        self._client.get_agent_session(self._target_id, session_id),
-                        synchronized,
-                    )
+                    return self._client.get_agent_session(self._target_id, session_id)
+                if detach.is_set():
+                    return None
                 now = time.monotonic()
                 if stdin_eof.is_set() and self._task is None and not end_sent:
                     self._client.post_agent_session_command(self._target_id, session_id, "end")
                     end_sent = True
-                if synchronized is not None and now - last_workspace_push >= _WORKSPACE_SYNC_TICK_S:
-                    synchronized = self._push_local_patch(session_id, synchronized)
+                if workspace is not None and now - last_workspace_push >= _WORKSPACE_SYNC_TICK_S:
+                    workspace.try_push_local()
                     last_workspace_push = now
                 time.sleep(0.5)
             except KeyboardInterrupt:
                 self._interrupts += 1
                 kind = "interrupt" if self._interrupts == 1 else "end"
-                _console.print(
-                    "\n[yellow]interrupting (press Ctrl-C again to end)[/yellow]"
-                    if kind == "interrupt"
-                    else "\n[yellow]ending session[/yellow]"
-                )
-                self._client.post_agent_session_command(self._target_id, session_id, kind)
+                # The next Ctrl-C frequently lands inside this handler (the
+                # print or the HTTP post); escalate to the end action instead
+                # of crashing out with the session still live.
+                try:
+                    _console.print(
+                        "\n[yellow]interrupting (press Ctrl-C again to end)[/yellow]"
+                        if kind == "interrupt"
+                        else "\n[yellow]ending session[/yellow]"
+                    )
+                    self._client.post_agent_session_command(self._target_id, session_id, kind)
+                except KeyboardInterrupt:
+                    self._interrupts += 1
+                    with contextlib.suppress(KeyboardInterrupt, PlatformError):
+                        _console.print("\n[yellow]ending session[/yellow]")
+                        self._client.post_agent_session_command(self._target_id, session_id, "end")
                 continue
-
-    def _apply_remote_patch(
-        self,
-        session_id: str,
-        event: object,
-        synchronized: WorkspaceSnapshot,
-    ) -> WorkspaceSnapshot:
-        """Download and apply one announced E2B patch, then advance the local base."""
-        jail_root = self._jail
-        if jail_root is None:
-            raise WorkspaceSyncError("workspace sync is not enabled")
-        payload = getattr(event, "payload", {})
-        revision_value = payload.get("revision") if isinstance(payload, dict) else None
-        if not isinstance(revision_value, str) or not revision_value:
-            raise WorkspaceSyncError("workspace patch event has no revision")
-        content = self._client.download_agent_workspace_patch(
-            self._target_id, session_id, revision_value
-        )
-        result = apply_workspace_patch(jail_root, content)
-        self._live_conflicts.update(result.conflicts)
-        self._client.acknowledge_agent_workspace_patch(self._target_id, session_id, revision_value)
-        if result.applied:
-            _console.print(f"[dim]workspace updated ({len(result.applied)} changed paths)[/dim]")
-        if result.conflicts:
-            paths = ", ".join(result.conflicts)
-            _console.print(f"[yellow]workspace sync conflict[/yellow]: {paths}")
-        return snapshot_workspace(jail_root)
-
-    def _push_local_patch(
-        self, session_id: str, synchronized: WorkspaceSnapshot
-    ) -> WorkspaceSnapshot:
-        """Send local edits made since the last synchronized snapshot."""
-        jail_root = self._jail
-        if jail_root is None:
-            return synchronized
-        try:
-            current = snapshot_workspace(jail_root)
-        except WorkspaceSyncError:
-            return synchronized
-        content = build_workspace_patch(synchronized.archive, current.archive)
-        if content is None:
-            return synchronized
-        result = self._client.upload_agent_workspace_patch(self._target_id, session_id, content)
-        self._live_conflicts.update(result.conflicts)
-        if result.conflicts:
-            paths = ", ".join(result.conflicts)
-            _console.print(f"[yellow]workspace sync conflict[/yellow]: {paths}")
-        # A conflicted path was rejected by E2B, so ``current`` cannot become
-        # the synchronized base. Keep the prior base and conservatively retry
-        # accepted sibling paths until the conflict is reconciled at teardown.
-        return synchronized if result.conflicts else current
 
 
 class RemoteWorldModelDriver:
@@ -709,6 +752,12 @@ class RemoteWorldModelDriver:
             if line in {":quit", ":q", ":exit"}:
                 _console.print("[dim]bye[/dim]")
                 return
+            if line == ":detach":
+                _console.print(
+                    "[yellow]world-model sessions are interactive only; :detach works "
+                    "for hosted agent sessions. Use :quit to leave.[/yellow]"
+                )
+                continue
             if line in {":help", ":h"}:
                 _console.print(
                     'Tool call: [cyan]name {"arg": "value"}[/cyan]. '
@@ -766,6 +815,21 @@ _PROVIDER_OPT = typer.Option(
 _MODEL_OPT = typer.Option("--model", help="Worker model for the built-in local pi harness.")
 _TASK_OPT = typer.Option("--task", "--instruction", help="Opening task for either execution kind.")
 _YES_OPT = typer.Option("--yes", help="Skip the local-execution consent prompt.")
+_DETACH_OPT = typer.Option(
+    "-d", "--detach", help="Start the hosted agent session and return, leaving it running."
+)
+_SEND_OPT = typer.Option(
+    "-s", "--send", help="Send one message to the current (or --session) session and stream it."
+)
+_ATTACH_OPT = typer.Option(
+    "-a", "--attach", help="Attach interactively to the current (or --session) session."
+)
+_END_OPT = typer.Option(
+    "--end", help="End the current (or --session) session after a final workspace sync."
+)
+_SESSION_OPT = typer.Option(
+    "--session", help="Hosted session id to address instead of the current session."
+)
 
 
 def register(app: typer.Typer) -> None:
@@ -780,8 +844,30 @@ def register(app: typer.Typer) -> None:
         model: Annotated[str | None, _MODEL_OPT] = None,
         task: Annotated[str | None, _TASK_OPT] = None,
         yes: Annotated[bool, _YES_OPT] = False,
+        detach: Annotated[bool, _DETACH_OPT] = False,
+        send: Annotated[str | None, _SEND_OPT] = None,
+        attach: Annotated[bool, _ATTACH_OPT] = False,
+        end: Annotated[bool, _END_OPT] = False,
+        session: Annotated[str | None, _SESSION_OPT] = None,
     ) -> None:
         """Run a platform world model/agent by id, or the built-in pi harness."""
+        action = _session_action(send=send, attach=attach, end=end)
+        if action is not None:
+            _reject_run_options_for_session_commands(
+                target=target,
+                directory=directory,
+                upload_directory=upload_directory,
+                provider=provider,
+                model=model,
+                task=task,
+                detach=detach,
+            )
+            _build_session_command_driver(action=action, text=send, session_override=session).run()
+            return
+        if session is not None:
+            raise typer.BadParameter("--session requires --send, --attach, or --end")
+        if detach and target is None:
+            raise typer.BadParameter("--detach requires a platform agent id")
         if target is None and upload_directory is not None:
             raise typer.BadParameter("--upload-dir is only supported for platform agent ids")
         if target is not None and directory is not None:
@@ -812,8 +898,79 @@ def register(app: typer.Typer) -> None:
             model=model,
             task=task,
             confirm_local=confirm_local,
+            detach=detach,
         )
         driver.run()
+
+
+def _session_action(*, send: str | None, attach: bool, end: bool) -> SessionAction | None:
+    """The single detached-session action requested, or ``None`` for a plain run."""
+    chosen: list[SessionAction] = []
+    if send is not None:
+        chosen.append("send")
+    if attach:
+        chosen.append("attach")
+    if end:
+        chosen.append("end")
+    if not chosen:
+        return None
+    if len(chosen) > 1:
+        raise typer.BadParameter("--send, --attach, and --end are mutually exclusive")
+    return chosen[0]
+
+
+def _reject_run_options_for_session_commands(
+    *,
+    target: str | None,
+    directory: str | None,
+    upload_directory: str | None,
+    provider: str | None,
+    model: str | None,
+    task: str | None,
+    detach: bool,
+) -> None:
+    """Keep run-start options off the commands that address an existing session."""
+    if detach:
+        raise typer.BadParameter(
+            "--detach starts a new session; it cannot be combined with --send/--attach/--end"
+        )
+    if target is not None:
+        raise typer.BadParameter(
+            "--send/--attach/--end address an existing session; omit the agent id "
+            "(use --session <session-id> to pick one)"
+        )
+    if upload_directory is not None or directory is not None:
+        raise typer.BadParameter(
+            "workspace sync is chosen when the session starts "
+            "(`wmh run <agent-id> -u PATH --detach`); it cannot be changed afterwards"
+        )
+    if provider is not None or model is not None:
+        raise typer.BadParameter(
+            "hosted sessions use platform credentials; --provider/--model are not accepted"
+        )
+    if task is not None:
+        raise typer.BadParameter(
+            "--task only applies when starting a run; use --send to message the session"
+        )
+
+
+def _build_session_command_driver(
+    *, action: SessionAction, text: str | None, session_override: str | None
+) -> DetachedCommandDriver:
+    """Assemble the authenticated driver behind --send/--attach/--end."""
+    credentials = load_credentials()
+    if not credentials.is_complete():
+        raise typer.BadParameter("run `wmh login` to use hosted agent sessions")
+    client = PlatformClient(str(credentials.api_url), str(credentials.token))
+    return DetachedCommandDriver(
+        client=client,
+        credentials=credentials,
+        state_store=SessionStateStore(),
+        action=action,
+        text=text,
+        session_override=session_override,
+        sink=TerminalEventSink(recorder=None, on_running=lambda _running: None),
+    )
 
 
 def _confirm_local_execution(jail_root: Path, *, target: str | None, yes: bool) -> None:
@@ -837,7 +994,8 @@ def _build_driver(
     model: str | None,
     task: str | None,
     confirm_local: Callable[[], None] | None = None,
-) -> LocalLiveDriver | RemoteAgentDriver | RemoteWorldModelDriver:
+    detach: bool = False,
+) -> LocalLiveDriver | RemoteAgentDriver | RemoteWorldModelDriver | DetachedStartDriver:
     """Resolve the target kind once and assemble its execution driver."""
     credentials = load_credentials()
     logged_in = credentials.is_complete()
@@ -903,11 +1061,34 @@ def _build_driver(
     try:
         resolved = client.resolve_run_target(target)
         if resolved.kind == "world_model":
+            if detach:
+                client.close()
+                raise typer.BadParameter(
+                    "world-model sessions are interactive only; --detach needs an agent id"
+                )
             if jail_root is not None:
                 client.close()
                 raise typer.BadParameter("--upload-dir is only supported for agent ids")
             return RemoteWorldModelDriver(client, resolved.id, resolved.name, task)
-        return RemoteAgentDriver(client, resolved.id, resolved.name, jail_root, task)
+        if detach:
+            return DetachedStartDriver(
+                client=client,
+                credentials=credentials,
+                state_store=SessionStateStore(),
+                target_id=resolved.id,
+                name=resolved.name,
+                jail_root=jail_root,
+                task=task,
+            )
+        return RemoteAgentDriver(
+            client,
+            resolved.id,
+            resolved.name,
+            jail_root,
+            task,
+            credentials=credentials,
+            state_store=SessionStateStore(),
+        )
     except PlatformError as error:
         client.close()
         raise typer.BadParameter(str(error)) from error

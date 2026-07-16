@@ -12,7 +12,9 @@ import pytest
 
 from wmh.cli.workspace_sync import (
     WorkspaceSyncError,
+    apply_patch_to_snapshot,
     apply_workspace_patch,
+    snapshot_from_archive,
     snapshot_workspace,
     sync_workspace,
     write_conflict_archive,
@@ -157,3 +159,118 @@ def test_sync_rejects_traversal_and_links(tmp_path: Path) -> None:
         archive.addfile(info)
     with pytest.raises(WorkspaceSyncError, match="regular file or directory"):
         sync_workspace(tmp_path, initial, buffer.getvalue())
+
+
+def test_snapshot_from_archive_rehydrates_the_manifest(tmp_path: Path) -> None:
+    """A persisted checkpoint archive restores the exact snapshot it was saved from."""
+    (tmp_path / "a.txt").write_text("alpha", encoding="utf-8")
+    package = tmp_path / "pkg"
+    package.mkdir()
+    (package / "b.py").write_text("print('b')", encoding="utf-8")
+    original = snapshot_workspace(tmp_path)
+
+    restored = snapshot_from_archive(original.archive)
+
+    assert restored.files == original.files
+    assert restored.archive == original.archive
+
+
+def test_snapshot_from_archive_rejects_malformed_bytes() -> None:
+    """Corrupted checkpoint bytes are a clean error, never a silent empty base."""
+    with pytest.raises(WorkspaceSyncError, match="gzip tar"):
+        snapshot_from_archive(b"not a tar archive")
+
+
+def test_snapshot_from_archive_rejects_unsafe_entries(tmp_path: Path) -> None:
+    """Traversal and non-regular entries cannot enter a rehydrated manifest."""
+    with pytest.raises(WorkspaceSyncError, match="unsafe"):
+        snapshot_from_archive(_archive({"../escape": (b"bad", 0o644)}))
+
+    buffer = io.BytesIO()
+    with tarfile.open(fileobj=buffer, mode="w:gz") as archive:
+        info = tarfile.TarInfo("link")
+        info.type = tarfile.SYMTYPE
+        info.linkname = "/etc/passwd"
+        archive.addfile(info)
+    with pytest.raises(WorkspaceSyncError, match="regular file"):
+        snapshot_from_archive(buffer.getvalue())
+
+
+def test_apply_patch_to_snapshot_advances_base_without_reading_disk(tmp_path: Path) -> None:
+    """The synchronized base advances by base+patch, never by re-reading local files."""
+    (tmp_path / "answer.txt").write_text("before", encoding="utf-8")
+    base = snapshot_workspace(tmp_path)
+    patch = build_workspace_patch(base.archive, _archive({"answer.txt": (b"during", 0o644)}))
+    assert patch is not None
+    # A local, not-yet-uploaded edit must stay out of the advanced base.
+    (tmp_path / "local-only.txt").write_text("unpushed", encoding="utf-8")
+
+    advanced = apply_patch_to_snapshot(base, patch, conflicts=())
+
+    assert set(advanced.files) == {"answer.txt"}
+    assert advanced.files["answer.txt"] != base.files["answer.txt"]
+    restored = snapshot_from_archive(advanced.archive)
+    assert restored.files == advanced.files
+
+
+def test_apply_patch_to_snapshot_keeps_conflicted_paths_at_their_base(tmp_path: Path) -> None:
+    """A locally-conflicted operation leaves the base unchanged for that path."""
+    (tmp_path / "same.txt").write_text("before", encoding="utf-8")
+    (tmp_path / "other.txt").write_text("keep", encoding="utf-8")
+    base = snapshot_workspace(tmp_path)
+    patch = build_workspace_patch(
+        base.archive,
+        _archive({"same.txt": (b"remote", 0o644), "other.txt": (b"changed", 0o644)}),
+    )
+    assert patch is not None
+
+    advanced = apply_patch_to_snapshot(base, patch, conflicts=("same.txt",))
+
+    assert advanced.files["same.txt"] == base.files["same.txt"]
+    assert advanced.files["other.txt"] != base.files["other.txt"]
+
+
+def test_sync_never_conflicts_a_path_that_converged(tmp_path: Path) -> None:
+    """Local and remote agreeing is synchronization, even for a protected path."""
+    (tmp_path / "same.txt").write_text("B", encoding="utf-8")
+    initial = snapshot_workspace(tmp_path)
+    (tmp_path / "same.txt").write_text("A", encoding="utf-8")
+    final = _archive({"same.txt": (b"A", 0o644)})
+
+    result = sync_workspace(tmp_path, initial, final, protected_paths=frozenset({"same.txt"}))
+
+    assert result.conflicts == ()
+    assert result.applied == ()
+    assert (tmp_path / "same.txt").read_text(encoding="utf-8") == "A"
+
+
+def test_sync_conflicts_when_remote_deletion_meets_a_local_directory(tmp_path: Path) -> None:
+    """A non-file occupying a remotely-deleted path is a conflict, not convergence."""
+    (tmp_path / "same.txt").write_text("B", encoding="utf-8")
+    initial = snapshot_workspace(tmp_path)
+    (tmp_path / "same.txt").unlink()
+    (tmp_path / "same.txt").mkdir()
+    final = _archive({})
+
+    result = sync_workspace(tmp_path, initial, final)
+
+    assert result.conflicts == ("same.txt",)
+    assert (tmp_path / "same.txt").is_dir()
+
+
+def test_conflict_archive_write_is_atomic(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A crash mid-write must not leave a truncated recovery archive behind."""
+    import wmh.cli.workspace_sync as workspace_sync_module
+
+    def failing_replace(_src: str, _dst: str) -> None:
+        raise OSError("simulated crash at the swap")
+
+    monkeypatch.setattr(workspace_sync_module.os, "replace", failing_replace)
+
+    with pytest.raises(OSError, match="simulated"):
+        write_conflict_archive(tmp_path, "sess-1", b"archive-bytes")
+
+    directory = tmp_path / ".wmh-conflicts"
+    # Neither a partial target nor a stray temporary file survives the crash.
+    assert not (directory / "sess-1.tar.gz").exists()
+    assert [p for p in directory.iterdir()] == []

@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import io
 import os
@@ -14,8 +15,12 @@ import tempfile
 import uuid
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
+from typing import TYPE_CHECKING
 
 from wmh.harness.workspace_patch import PatchFileState, parse_workspace_patch
+
+if TYPE_CHECKING:
+    from collections.abc import Iterable
 
 MAX_WORKSPACE_ARCHIVE_BYTES = 50 * 1024 * 1024
 MAX_WORKSPACE_UNPACKED_BYTES = 512 * 1024 * 1024
@@ -105,6 +110,143 @@ def snapshot_workspace(root: Path) -> WorkspaceSnapshot:
     return WorkspaceSnapshot(archive=content, files=files)
 
 
+def snapshot_from_archive(content: bytes) -> WorkspaceSnapshot:
+    """Rehydrate a snapshot (archive plus manifest) from persisted archive bytes.
+
+    Detached sessions persist their last synchronized archive between CLI
+    invocations; the manifest is recomputed from the archive itself so the
+    checkpoint has a single source of truth.
+
+    Raises:
+        WorkspaceSyncError: If the bytes are not a safe regular-file archive.
+    """
+    files = {
+        path: FileState(
+            sha256=hashlib.sha256(body, usedforsecurity=False).hexdigest(),
+            mode=stat.S_IMODE(mode),
+        )
+        for path, (body, mode) in _archive_files(content).items()
+    }
+    return WorkspaceSnapshot(archive=content, files=files)
+
+
+def apply_patch_to_snapshot(
+    snapshot: WorkspaceSnapshot, content: bytes, *, conflicts: Iterable[str] = ()
+) -> WorkspaceSnapshot:
+    """Advance a synchronized base by the patch operations that landed locally.
+
+    The base must reflect only synchronized content. Re-reading the local
+    directory here would absorb not-yet-uploaded local edits into the base,
+    so they would never upload and the final sync could even delete them.
+    Conflicted paths keep their base state: the disagreement stays visible to
+    both sides until the terminal reconciliation.
+
+    Raises:
+        WorkspaceSyncError: If the patch or the rebuilt base violates limits.
+    """
+    try:
+        patch = parse_workspace_patch(content)
+    except Exception as error:  # noqa: BLE001 - normalize to the sync error surface
+        raise WorkspaceSyncError(f"workspace patch is invalid: {error}") from error
+    rejected = set(conflicts)
+    files = _archive_files(snapshot.archive)
+    for operation in patch.operations:
+        if operation.path in rejected:
+            continue
+        if operation.after is None:
+            files.pop(operation.path, None)
+        else:
+            files[operation.path] = (patch.files[operation.path], operation.after.mode)
+    return _snapshot_from_files(files)
+
+
+def advance_snapshot_paths(
+    base: WorkspaceSnapshot, current: WorkspaceSnapshot, paths: Iterable[str]
+) -> WorkspaceSnapshot:
+    """Advance only ``paths`` of the base to their state in ``current``.
+
+    A partially-accepted upload moves the sandbox for the accepted paths only.
+    Advancing the whole base would hide the rejected paths' divergence, while
+    advancing nothing re-pushes the accepted paths against a stale base later,
+    which can manufacture conflicts if they change again locally in between.
+    """
+    files = _archive_files(base.archive)
+    replacements = _archive_files(current.archive)
+    for path in paths:
+        if path in replacements:
+            files[path] = replacements[path]
+        else:
+            files.pop(path, None)
+    return _snapshot_from_files(files)
+
+
+def _archive_files(content: bytes) -> dict[str, tuple[bytes, int]]:
+    """Read a checkpoint archive's regular files as ``{path: (bytes, mode)}``."""
+    if len(content) > MAX_WORKSPACE_ARCHIVE_BYTES:
+        msg = f"workspace archive exceeds {MAX_WORKSPACE_ARCHIVE_BYTES} compressed bytes"
+        raise WorkspaceSyncError(msg)
+    files: dict[str, tuple[bytes, int]] = {}
+    total = 0
+    try:
+        with tarfile.open(fileobj=io.BytesIO(content), mode="r:gz") as archive:
+            members = archive.getmembers()
+            if len(members) > MAX_WORKSPACE_ENTRIES:
+                msg = f"workspace archive has more than {MAX_WORKSPACE_ENTRIES} entries"
+                raise WorkspaceSyncError(msg)
+            for member in members:
+                relative = _normalized_name(member.name)
+                if member.isdir():
+                    continue
+                if not member.isfile():
+                    msg = f"workspace entry must be a regular file or directory: {member.name}"
+                    raise WorkspaceSyncError(msg)
+                if relative in files:
+                    raise WorkspaceSyncError(f"duplicate workspace path: {relative}")
+                total += member.size
+                if total > MAX_WORKSPACE_UNPACKED_BYTES:
+                    msg = f"workspace expands beyond {MAX_WORKSPACE_UNPACKED_BYTES} bytes"
+                    raise WorkspaceSyncError(msg)
+                source = archive.extractfile(member)
+                if source is None:
+                    raise WorkspaceSyncError(f"workspace file has no content: {member.name}")
+                with source:
+                    body = source.read()
+                files[relative] = (body, stat.S_IMODE(member.mode))
+    except WorkspaceSyncError:
+        raise
+    except (tarfile.TarError, OSError, EOFError) as error:
+        msg = "workspace must be a valid gzip tar archive"
+        raise WorkspaceSyncError(msg) from error
+    return files
+
+
+def _snapshot_from_files(files: dict[str, tuple[bytes, int]]) -> WorkspaceSnapshot:
+    """Build a deterministic snapshot archive plus manifest from file contents."""
+    total = sum(len(body) for body, _mode in files.values())
+    if total > MAX_WORKSPACE_UNPACKED_BYTES:
+        msg = f"workspace files exceed {MAX_WORKSPACE_UNPACKED_BYTES} uncompressed bytes"
+        raise WorkspaceSyncError(msg)
+    buffer = io.BytesIO()
+    manifest: dict[str, FileState] = {}
+    with tarfile.open(fileobj=buffer, mode="w:gz") as archive:
+        for path in sorted(files):
+            body, mode = files[path]
+            info = tarfile.TarInfo(path)
+            info.size = len(body)
+            info.mode = stat.S_IMODE(mode)
+            info.mtime = 0
+            archive.addfile(info, io.BytesIO(body))
+            manifest[path] = FileState(
+                sha256=hashlib.sha256(body, usedforsecurity=False).hexdigest(),
+                mode=stat.S_IMODE(mode),
+            )
+    content = buffer.getvalue()
+    if len(content) > MAX_WORKSPACE_ARCHIVE_BYTES:
+        msg = f"workspace archive exceeds {MAX_WORKSPACE_ARCHIVE_BYTES} compressed bytes"
+        raise WorkspaceSyncError(msg)
+    return WorkspaceSnapshot(archive=content, files=manifest)
+
+
 def sync_workspace(
     root: Path,
     initial: WorkspaceSnapshot,
@@ -131,14 +273,19 @@ def sync_workspace(
                 continue
             target = resolved / relative
             now = current.get(relative)
-            if (
-                relative in protected_paths
-                or _has_non_file_collision(target, now)
-                or (now != before and now != after)
-            ):
+            # A directory/link/special file occupying the path is always a
+            # conflict: the manifests cannot see it, so no equality below is
+            # trustworthy.
+            if _has_non_file_collision(target, now):
                 conflicts.append(relative)
                 continue
+            # Local and remote agreeing (content and mode) is synchronization,
+            # not a conflict, even for a path protected by an earlier live
+            # disagreement that has since reconverged.
             if now == after:
+                continue
+            if relative in protected_paths or now != before:
+                conflicts.append(relative)
                 continue
             try:
                 if after is None:
@@ -184,11 +331,26 @@ def apply_workspace_patch(root: Path, content: bytes) -> SyncResult:
 
 
 def write_conflict_archive(root: Path, session_id: str, content: bytes) -> Path:
-    """Preserve a downloaded result archive when automatic reconciliation conflicts."""
+    """Preserve a downloaded result archive when automatic reconciliation conflicts.
+
+    The archive is the only remaining copy of the agent's work once the
+    handoff is acknowledged, so it lands atomically: a crash mid-write leaves
+    the previous file (or nothing), never a truncated archive.
+    """
     directory = root.resolve() / ".wmh-conflicts"
     directory.mkdir(parents=True, exist_ok=True)
     path = directory / f"{session_id}.tar.gz"
-    path.write_bytes(content)
+    fd, tmp_name = tempfile.mkstemp(dir=directory, prefix=f"{path.name}.")
+    try:
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(content)
+        os.replace(tmp_name, path)
+    except BaseException:
+        # The replace may already have consumed the temp file; a missing file
+        # must not mask the original exception.
+        with contextlib.suppress(OSError):
+            os.unlink(tmp_name)
+        raise
     return path
 
 

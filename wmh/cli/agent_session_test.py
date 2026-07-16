@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import io
 import tarfile
+import threading
 from pathlib import Path
 from typing import TYPE_CHECKING, cast
 
@@ -15,9 +16,13 @@ from llm_waterfall.types import ChatChoice, ChatMessage, ChatRequest, ChatRespon
 from typer.testing import CliRunner
 
 import wmh.cli.agent_session as mod
+import wmh.cli.hosted_session as hosted_mod
 from wmh.cli import app
+from wmh.cli.session_state import DetachedSessionState, SessionStateError, SessionStateStore
+from wmh.cli.workspace_sync import snapshot_from_archive
 from wmh.harness.live_session import SessionEvent
 from wmh.harness.workspace_patch import build_workspace_patch
+from wmh.platform.client import PlatformError
 from wmh.platform.credentials import PlatformCredentials
 
 if TYPE_CHECKING:
@@ -490,27 +495,6 @@ def test_local_driver_returns_nonzero_when_the_runner_fails(
     assert channel.closed
 
 
-def test_conflicted_local_patch_does_not_advance_the_synchronized_base(tmp_path: Path) -> None:
-    """A rejected same-file edit remains outside the platform-accepted snapshot."""
-    path = tmp_path / "answer.txt"
-    path.write_text("before", encoding="utf-8")
-    initial = mod.snapshot_workspace(tmp_path)
-    path.write_text("local", encoding="utf-8")
-
-    class _Client:
-        def upload_agent_workspace_patch(self, *_args: object, **_kwargs: object) -> object:
-            return type("Result", (), {"conflicts": ("answer.txt",)})()
-
-    driver = mod.RemoteAgentDriver(
-        cast("mod.PlatformClient", _Client()), "agent-1", "Agent", tmp_path, "work"
-    )
-
-    synchronized = driver._push_local_patch("session-1", initial)
-
-    assert synchronized is initial
-    assert driver._live_conflicts == {"answer.txt"}
-
-
 def test_remote_agent_driver_syncs_final_e2b_workspace(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -569,7 +553,13 @@ def test_remote_agent_driver_syncs_final_e2b_workspace(
     monkeypatch.setattr(mod, "RemoteAgentCommandReader", _NoReader)
 
     mod.RemoteAgentDriver(
-        cast("mod.PlatformClient", client), "agent-1", "Agent", tmp_path, "fix it"
+        cast("mod.PlatformClient", client),
+        "agent-1",
+        "Agent",
+        tmp_path,
+        "fix it",
+        credentials=PlatformCredentials(api_url="https://api.test", token="xpl_test"),
+        state_store=SessionStateStore(tmp_path / ".state"),
     ).run()
 
     assert (tmp_path / "answer.txt").read_text(encoding="utf-8") == "after"
@@ -617,7 +607,7 @@ def test_failed_hosted_session_is_not_hidden_by_workspace_conflicts(
     client = _HostedClient()
     monkeypatch.setattr(mod, "RemoteAgentCommandReader", _NoReader)
     monkeypatch.setattr(
-        mod,
+        hosted_mod,
         "sync_workspace",
         lambda *_args, **_kwargs: type(
             "Result", (), {"applied": (), "conflicts": ("answer.txt",)}
@@ -626,7 +616,13 @@ def test_failed_hosted_session_is_not_hidden_by_workspace_conflicts(
 
     with pytest.raises(typer.Exit) as raised:
         mod.RemoteAgentDriver(
-            cast("mod.PlatformClient", client), "agent-1", "Agent", tmp_path, "fix it"
+            cast("mod.PlatformClient", client),
+            "agent-1",
+            "Agent",
+            tmp_path,
+            "fix it",
+            credentials=PlatformCredentials(api_url="https://api.test", token="xpl_test"),
+            state_store=SessionStateStore(tmp_path / ".state"),
         ).run()
 
     assert raised.value.exit_code == 1
@@ -681,7 +677,13 @@ def test_remote_agent_driver_without_upload_never_reads_local_workspace(
     monkeypatch.setattr(mod, "RemoteAgentCommandReader", _NoReader)
 
     mod.RemoteAgentDriver(
-        cast("mod.PlatformClient", client), "agent-1", "Agent", None, "work remotely"
+        cast("mod.PlatformClient", client),
+        "agent-1",
+        "Agent",
+        None,
+        "work remotely",
+        credentials=PlatformCredentials(api_url="https://api.test", token="xpl_test"),
+        state_store=SessionStateStore(tmp_path / ".state"),
     ).run()
 
     assert client.created_workspaces == [None]
@@ -716,7 +718,7 @@ def test_remote_agent_driver_applies_live_workspace_patch(
             event = type(
                 "Event",
                 (),
-                {"kind": "workspace_patch", "payload": {"revision": "patch-1"}},
+                {"seq": 1, "kind": "workspace_patch", "payload": {"revision": "patch-1"}},
             )()
             return type("Page", (), {"events": [event], "last_seq": 1, "status": "ended"})()
 
@@ -754,9 +756,522 @@ def test_remote_agent_driver_applies_live_workspace_patch(
     monkeypatch.setattr(mod, "RemoteAgentCommandReader", _NoReader)
 
     mod.RemoteAgentDriver(
-        cast("mod.PlatformClient", client), "agent-1", "Agent", tmp_path, None
+        cast("mod.PlatformClient", client),
+        "agent-1",
+        "Agent",
+        tmp_path,
+        None,
+        credentials=PlatformCredentials(api_url="https://api.test", token="xpl_test"),
+        state_store=SessionStateStore(tmp_path / ".state"),
     ).run()
 
     assert (tmp_path / "answer.txt").read_text(encoding="utf-8") == "during"
     assert client.patch_acks == ["patch-1"]
     assert client.closed
+
+
+# -- detached session flags -------------------------------------------------------------------
+
+
+def test_run_session_flag_combinations_are_validated(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The detached options keep one unambiguous meaning per invocation."""
+    monkeypatch.setattr(
+        mod, "_build_session_command_driver", lambda **_kw: pytest.fail("must not build")
+    )
+    monkeypatch.setattr(mod, "_build_driver", lambda **_kw: pytest.fail("must not build"))
+    runner = CliRunner()
+
+    exclusive = runner.invoke(app, ["run", "-s", "hi", "-a"])
+    assert exclusive.exit_code != 0
+    assert "mutually exclusive" in exclusive.output
+
+    dangling_session = runner.invoke(app, ["run", "--session", "sess-1"])
+    assert dangling_session.exit_code != 0
+    assert "--session" in dangling_session.output
+
+    send_with_target = runner.invoke(app, ["run", "agent-1", "-s", "hi"])
+    assert send_with_target.exit_code != 0
+
+    detach_without_target = runner.invoke(app, ["run", "-d"])
+    assert detach_without_target.exit_code != 0
+    assert "agent id" in detach_without_target.output
+
+    send_with_upload = runner.invoke(app, ["run", "-s", "hi", "-u", "."])
+    assert send_with_upload.exit_code != 0
+
+    send_with_task = runner.invoke(app, ["run", "-s", "hi", "--task", "x"])
+    assert send_with_task.exit_code != 0
+
+    detach_with_send = runner.invoke(app, ["run", "agent-1", "-d", "-s", "hi"])
+    assert detach_with_send.exit_code != 0
+
+
+def test_run_dispatches_session_commands(monkeypatch: pytest.MonkeyPatch) -> None:
+    """--send/--attach/--end route to the detached command driver, unified in run."""
+    captured: list[dict[str, str | None]] = []
+
+    class _Driver:
+        def run(self) -> None:
+            pass
+
+    def build(**kwargs: str | None) -> _Driver:
+        captured.append(kwargs)
+        return _Driver()
+
+    monkeypatch.setattr(mod, "_build_session_command_driver", build)
+    runner = CliRunner()
+
+    assert runner.invoke(app, ["run", "--send", "do it"]).exit_code == 0
+    assert runner.invoke(app, ["run", "-a", "--session", "sess-2"]).exit_code == 0
+    assert runner.invoke(app, ["run", "--end"]).exit_code == 0
+
+    assert captured == [
+        {"action": "send", "text": "do it", "session_override": None},
+        {"action": "attach", "text": None, "session_override": "sess-2"},
+        {"action": "end", "text": None, "session_override": None},
+    ]
+
+
+def test_build_driver_detach_returns_start_driver(monkeypatch: pytest.MonkeyPatch) -> None:
+    """--detach on an agent id builds the detached start driver, not the streamer."""
+    creds = PlatformCredentials(api_url="https://api.test", token="xpl_test")
+    monkeypatch.setattr(mod, "load_credentials", lambda: creds)
+    client = _FakeClient()
+    monkeypatch.setattr(mod, "PlatformClient", lambda *_a, **_k: client)
+
+    driver = mod._build_driver(
+        target="a1",
+        jail_root=None,
+        provider=None,
+        model=None,
+        task="do it",
+        detach=True,
+    )
+
+    assert isinstance(driver, hosted_mod.DetachedStartDriver)
+
+
+def test_build_driver_detach_rejects_world_models(monkeypatch: pytest.MonkeyPatch) -> None:
+    """World-model sessions are interactive only; --detach names agents."""
+    creds = PlatformCredentials(api_url="https://api.test", token="xpl_test")
+    monkeypatch.setattr(mod, "load_credentials", lambda: creds)
+    client = _FakeClient()
+    client.target_kind = "world_model"
+    monkeypatch.setattr(mod, "PlatformClient", lambda *_a, **_k: client)
+
+    with pytest.raises(typer.BadParameter, match="agent"):
+        mod._build_driver(
+            target="wm-1",
+            jail_root=None,
+            provider=None,
+            model=None,
+            task=None,
+            detach=True,
+        )
+
+
+# -- plain-run :detach promotion ---------------------------------------------------------------
+
+
+class _DetachedReader:
+    """A reader stub whose user immediately detaches (never EOF, never end)."""
+
+    def __init__(self, *_args: object) -> None:
+        self.eof = threading.Event()
+        self.detach = threading.Event()
+        self.detach.set()
+
+    def start(self) -> None:
+        pass
+
+
+def _plain_driver(
+    client: object,
+    tmp_path: Path,
+    *,
+    jail_root: Path | None = None,
+    task: str | None = None,
+) -> tuple[mod.RemoteAgentDriver, SessionStateStore]:
+    """A plain hosted driver wired to an injectable session-state store."""
+    store = SessionStateStore(tmp_path / "state")
+    driver = mod.RemoteAgentDriver(
+        cast("mod.PlatformClient", client),
+        "agent-1",
+        "Agent",
+        jail_root,
+        task,
+        credentials=PlatformCredentials(
+            api_url="https://api.test", web_url="https://platform.test", token="xpl_test"
+        ),
+        state_store=store,
+    )
+    return driver, store
+
+
+def test_reader_detach_skips_eof_end_and_guards_unknown_commands(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """:detach stops reading without ending; unknown :commands never become chat."""
+
+    class _Client:
+        def __init__(self) -> None:
+            self.posted: list[tuple[str, str | None]] = []
+
+        def post_agent_session_command(
+            self, _agent_id: str, _session_id: str, kind: str, *, text: str | None = None
+        ) -> None:
+            self.posted.append((kind, text))
+
+    monkeypatch.setattr(mod.sys, "stdin", io.StringIO(":detach\n"))
+    client = _Client()
+    reader = mod.RemoteAgentCommandReader(cast("mod.PlatformClient", client), "a", "s")
+    reader.run()
+    assert reader.detach.is_set()
+    assert not reader.eof.is_set()
+    assert client.posted == []
+
+    monkeypatch.setattr(mod.sys, "stdin", io.StringIO(":frob\nhello\n:end\n"))
+    client = _Client()
+    reader = mod.RemoteAgentCommandReader(cast("mod.PlatformClient", client), "a", "s")
+    reader.run()
+    assert client.posted == [("user_message", "hello"), ("end", None)]
+    assert not reader.detach.is_set()
+
+
+def test_plain_run_detach_promotes_session_without_ending(tmp_path: Path) -> None:
+    """:detach in a plain run persists the current-session reference and exits."""
+
+    class _Client:
+        def __init__(self) -> None:
+            self.commands: list[str] = []
+            self.closed = False
+
+        def create_agent_session(self, *_args: object, **_kwargs: object) -> object:
+            return type("Session", (), {"id": "sess-1"})()
+
+        def list_agent_session_events(self, *_args: object, **_kwargs: object) -> object:
+            event = type(
+                "Event", (), {"seq": 3, "kind": "assistant_message", "payload": {"text": "hi"}}
+            )()
+            return type("Page", (), {"events": [event], "last_seq": 3, "status": "running"})()
+
+        def post_agent_session_command(
+            self, _agent_id: str, _session_id: str, kind: str, *, text: str | None = None
+        ) -> None:
+            _ = text
+            self.commands.append(kind)
+
+        def download_agent_workspace(self, *_args: object) -> bytes:
+            pytest.fail("a detach promotion must not run the final workspace sync")
+
+        def close(self) -> None:
+            self.closed = True
+
+    client = _Client()
+    driver, store = _plain_driver(client, tmp_path)
+    with pytest.MonkeyPatch.context() as patcher:
+        patcher.setattr(mod, "RemoteAgentCommandReader", _DetachedReader)
+        driver.run()
+
+    assert client.commands == []
+    assert client.closed
+    state = store.load("sess-1")
+    assert state is not None
+    assert state.api_url == "https://api.test"
+    assert state.agent_id == "agent-1"
+    assert state.session_id == "sess-1"
+    assert state.cursor == 3
+    assert state.workspace is None
+    assert store.current_session_id() == "sess-1"
+
+
+def test_plain_run_detach_with_workspace_checkpoints_without_final_sync(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Promotion persists the synced checkpoint; no finalize, patches stay acked."""
+    root = tmp_path / "work"
+    root.mkdir()
+    (root / "answer.txt").write_text("before", encoding="utf-8")
+    base = mod.snapshot_workspace(root)
+    remote = io.BytesIO()
+    with tarfile.open(fileobj=remote, mode="w:gz") as archive:
+        body = b"during"
+        info = tarfile.TarInfo("answer.txt")
+        info.size = len(body)
+        info.mode = 0o644
+        archive.addfile(info, io.BytesIO(body))
+    patch = build_workspace_patch(base.archive, remote.getvalue())
+    assert patch is not None
+
+    class _Client:
+        def __init__(self) -> None:
+            self.patch_acks: list[str] = []
+            self.closed = False
+
+        def create_agent_session(self, *_args: object, **_kwargs: object) -> object:
+            return type("Session", (), {"id": "sess-1"})()
+
+        def list_agent_session_events(self, *_args: object, **_kwargs: object) -> object:
+            event = type(
+                "Event", (), {"seq": 1, "kind": "workspace_patch", "payload": {"revision": "p1"}}
+            )()
+            return type("Page", (), {"events": [event], "last_seq": 1, "status": "running"})()
+
+        def download_agent_workspace_patch(
+            self, _agent_id: str, _session_id: str, revision: str
+        ) -> bytes:
+            assert revision == "p1"
+            return patch
+
+        def acknowledge_agent_workspace_patch(
+            self, _agent_id: str, _session_id: str, revision: str
+        ) -> None:
+            self.patch_acks.append(revision)
+
+        def download_agent_workspace(self, *_args: object) -> bytes:
+            pytest.fail("a detach promotion must not run the final workspace sync")
+
+        def acknowledge_agent_workspace(self, *_args: object) -> None:
+            pytest.fail("a detach promotion must not acknowledge the final workspace")
+
+        def close(self) -> None:
+            self.closed = True
+
+    client = _Client()
+    driver, store = _plain_driver(client, tmp_path, jail_root=root)
+    monkeypatch.setattr(mod, "RemoteAgentCommandReader", _DetachedReader)
+    driver.run()
+
+    assert client.patch_acks == ["p1"]
+    assert (root / "answer.txt").read_text(encoding="utf-8") == "during"
+    state = store.load("sess-1")
+    assert state is not None
+    assert state.cursor == 1
+    assert state.workspace is not None
+    assert state.workspace.root == str(root)
+    checkpoint = snapshot_from_archive(store.load_base_archive(state))
+    assert checkpoint.files == mod.snapshot_workspace(root).files
+
+
+def test_plain_run_detach_state_failure_names_the_session(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A failed promotion save still hands the user the session id."""
+
+    class _FailingStore(SessionStateStore):
+        def save(
+            self, state: DetachedSessionState, *, base_archive: bytes | None = None
+        ) -> DetachedSessionState:
+            raise SessionStateError("disk full")
+
+    class _Client:
+        def create_agent_session(self, *_args: object, **_kwargs: object) -> object:
+            return type("Session", (), {"id": "sess-1"})()
+
+        def list_agent_session_events(self, *_args: object, **_kwargs: object) -> object:
+            return type("Page", (), {"events": [], "last_seq": 0, "status": "running"})()
+
+        def close(self) -> None:
+            pass
+
+    driver = mod.RemoteAgentDriver(
+        cast("mod.PlatformClient", _Client()),
+        "agent-1",
+        "Agent",
+        None,
+        None,
+        credentials=PlatformCredentials(api_url="https://api.test", token="xpl_test"),
+        state_store=_FailingStore(tmp_path / "state"),
+    )
+    monkeypatch.setattr(mod, "RemoteAgentCommandReader", _DetachedReader)
+    with pytest.raises(typer.BadParameter, match="sess-1"):
+        driver.run()
+
+
+def test_world_model_loop_rejects_detach(monkeypatch: pytest.MonkeyPatch) -> None:
+    """:detach in a world-model REPL warns instead of stepping the model."""
+
+    class _Client:
+        def step_world_model_session(self, *_args: object, **_kwargs: object) -> object:
+            pytest.fail(":detach must never reach the world model as an action")
+
+        def close(self) -> None:
+            pass
+
+    lines = iter([":detach", ":quit"])
+    monkeypatch.setattr(mod._console, "input", lambda *_a, **_k: next(lines))
+    driver = mod.RemoteWorldModelDriver(
+        cast("mod.PlatformClient", _Client()), "wm-1", "Model", None
+    )
+
+    driver._loop("sess-1")
+
+
+def test_reader_keeps_reading_after_a_failed_steer_post(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A transient post failure warns and keeps the session attached, never ends it."""
+
+    class _FlakyClient:
+        def __init__(self) -> None:
+            self.posted: list[tuple[str, str | None]] = []
+            self.failed_once = False
+
+        def post_agent_session_command(
+            self, _agent_id: str, _session_id: str, kind: str, *, text: str | None = None
+        ) -> None:
+            if kind == "user_message" and not self.failed_once:
+                self.failed_once = True
+                raise PlatformError("backend unavailable", status_code=503)
+            self.posted.append((kind, text))
+
+    monkeypatch.setattr(mod.sys, "stdin", io.StringIO("hello\n:stop\n"))
+    client = _FlakyClient()
+    reader = mod.RemoteAgentCommandReader(cast("mod.PlatformClient", client), "a", "s")
+
+    reader.run()
+
+    # The failed steer was reported, the reader kept going, and only true
+    # stdin EOF set the eof flag; nothing ended or detached the session.
+    assert client.posted == [("interrupt", None)]
+    assert reader.eof.is_set()
+    assert not reader.detach.is_set()
+    assert "failed" in capsys.readouterr().out
+
+
+def test_second_interrupt_during_the_plain_handler_still_ends(tmp_path: Path) -> None:
+    """A Ctrl-C landing inside the plain-run interrupt handler escalates to end."""
+
+    class _Client:
+        def __init__(self) -> None:
+            self.commands: list[str] = []
+            self.polls = 0
+            self.closed = False
+
+        def create_agent_session(self, *_args: object, **_kwargs: object) -> object:
+            return type("Session", (), {"id": "sess-1"})()
+
+        def list_agent_session_events(self, *_args: object, **_kwargs: object) -> object:
+            self.polls += 1
+            if self.polls == 1:
+                raise KeyboardInterrupt
+            return type("Page", (), {"events": [], "last_seq": 0, "status": "ended"})()
+
+        def post_agent_session_command(
+            self, _agent_id: str, _session_id: str, kind: str, *, text: str | None = None
+        ) -> None:
+            _ = text
+            self.commands.append(kind)
+            if kind == "interrupt":
+                raise KeyboardInterrupt
+
+        def get_agent_session(self, *_args: object) -> object:
+            return type("Session", (), {"status": "ended", "error": None})()
+
+        def close(self) -> None:
+            self.closed = True
+
+    class _NoReader:
+        def __init__(self, *_args: object) -> None:
+            pass
+
+        def start(self) -> None:
+            pass
+
+    client = _Client()
+    driver, _store = _plain_driver(client, tmp_path)
+    with pytest.MonkeyPatch.context() as patcher:
+        patcher.setattr(mod, "RemoteAgentCommandReader", _NoReader)
+        driver.run()
+
+    assert client.commands == ["interrupt", "end"]
+    assert client.closed
+
+
+def test_plain_run_interrupt_around_a_patch_ack_promotes_a_fresh_cursor(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A Ctrl-C during the patch ack must not leave a cursor that re-fetches it.
+
+    The resumed loop (and a later :detach promotion) must poll past the
+    processed patch event: its object is acknowledged, so re-requesting it
+    would 404 and abort the next detached command.
+    """
+    root = tmp_path / "work"
+    root.mkdir()
+    (root / "answer.txt").write_text("before", encoding="utf-8")
+    base = mod.snapshot_workspace(root)
+    remote = io.BytesIO()
+    with tarfile.open(fileobj=remote, mode="w:gz") as archive:
+        body = b"during"
+        info = tarfile.TarInfo("answer.txt")
+        info.size = len(body)
+        info.mode = 0o644
+        archive.addfile(info, io.BytesIO(body))
+    patch = build_workspace_patch(base.archive, remote.getvalue())
+    assert patch is not None
+
+    class _Client:
+        def __init__(self) -> None:
+            self.calls: list[str] = []
+            self.acks = 0
+            self.closed = False
+
+        def create_agent_session(self, *_args: object, **_kwargs: object) -> object:
+            return type("Session", (), {"id": "sess-1"})()
+
+        def list_agent_session_events(
+            self, _agent_id: str, _session_id: str, *, after: int
+        ) -> object:
+            self.calls.append(f"events after={after}")
+            if after == 0:
+                event = type(
+                    "Event",
+                    (),
+                    {"seq": 1, "kind": "workspace_patch", "payload": {"revision": "p1"}},
+                )()
+                return type("Page", (), {"events": [event], "last_seq": 1, "status": "running"})()
+            return type("Page", (), {"events": [], "last_seq": after, "status": "running"})()
+
+        def download_agent_workspace_patch(
+            self, _agent_id: str, _session_id: str, revision: str
+        ) -> bytes:
+            self.calls.append(f"patch:{revision}")
+            if revision != "p1" or self.acks:
+                pytest.fail("an acknowledged patch must never be re-requested")
+            return patch
+
+        def acknowledge_agent_workspace_patch(
+            self, _agent_id: str, _session_id: str, revision: str
+        ) -> None:
+            _ = revision
+            self.acks += 1
+            raise KeyboardInterrupt
+
+        def post_agent_session_command(
+            self, _agent_id: str, _session_id: str, kind: str, *, text: str | None = None
+        ) -> None:
+            _ = kind, text
+
+        def close(self) -> None:
+            self.closed = True
+
+    class _DetachAfterResume:
+        def __init__(self, *_args: object) -> None:
+            self.eof = threading.Event()
+            self.detach = threading.Event()
+            self.detach.set()
+
+        def start(self) -> None:
+            pass
+
+    client = _Client()
+    driver, store = _plain_driver(client, tmp_path, jail_root=root)
+    monkeypatch.setattr(mod, "RemoteAgentCommandReader", _DetachAfterResume)
+    driver.run()
+
+    assert client.calls.count("patch:p1") == 1
+    assert "events after=1" in client.calls
+    state = store.load("sess-1")
+    assert state is not None
+    assert state.cursor == 1
