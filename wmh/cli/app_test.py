@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import cast
 
 import pytest
+import typer
 from typer.testing import CliRunner
 
 from wmh.cli import app
@@ -798,3 +799,39 @@ def test_download_picker_lists_published_and_fetches_choice(
     assert result.exit_code == 0, result.output
     assert fetched == ["gaia2"]
     assert "not downloaded" in result.output  # picker showed local status
+
+
+def test_grid_output_paths_never_collide() -> None:
+    # Regression: `--out foo.json` must NOT make the chart PNG overwrite the just-written result
+    # JSON. The JSON and PNG always get distinct suffixes off the same stem.
+    from wmh.cli.app import _grid_output_paths
+
+    default = Path("/tmp/grid/suite-run.json")
+    for out in ("foo.json", "foo.png", "foo", "dir/bar.json"):
+        json_path, png_path = _grid_output_paths(out, default)
+        assert json_path.suffix == ".json"
+        assert png_path.suffix == ".png"
+        assert json_path != png_path  # the bug: these were equal for `--out foo.json`
+        assert json_path.stem == png_path.stem == Path(out).stem
+    # No --out: fall back to the default JSON dest + its .png sibling.
+    json_path, png_path = _grid_output_paths(None, default)
+    assert json_path == default
+    assert png_path == default.with_suffix(".png")
+
+
+def test_parse_model_specs_validates_provider_and_resolves_model() -> None:
+    from wmh.cli.app import _parse_model_specs
+
+    specs = _parse_model_specs(
+        "Opus 4.8:bedrock:us.anthropic.claude-opus-4-8,Qwen:openai:qwen-agentworld-35b-a3b"
+    )
+    assert [(s.label, s.provider, s.model) for s in specs] == [
+        ("Opus 4.8", "bedrock", "us.anthropic.claude-opus-4-8"),  # exact wire id preserved
+        ("Qwen", "openai", "qwen-agentworld-35b-a3b"),  # self-hosted id passes through unchanged
+    ]
+    # A bad provider fails at parse time with a clear message, not deep inside run_grid.
+    with pytest.raises(typer.BadParameter, match="unknown provider"):
+        _parse_model_specs("X:notaprovider:m")
+    # Malformed entry (wrong arity) still rejected.
+    with pytest.raises(typer.BadParameter, match="bad --models entry"):
+        _parse_model_specs("Opus:bedrock")

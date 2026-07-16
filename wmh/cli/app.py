@@ -85,6 +85,8 @@ from wmh.engine.knowledge import KnowledgeBase
 from wmh.engine.prompts import BASE_ENV_PROMPT
 from wmh.engine.world_model import WorldModel
 from wmh.env.llm_agent import LLMAgent
+from wmh.evals.grid import GridResult, ModelSpec, merge_results, run_grid
+from wmh.evals.grid_plot import plot_grid, plot_grid_heatmap
 from wmh.evals.open_loop import EvalReport, OpenLoopEval
 from wmh.ingest import VendorPull, get_adapter, list_adapters
 from wmh.optimize.judge import JUDGE_VERSION, RubricJudge
@@ -754,6 +756,12 @@ def eval_(  # noqa: A001 - `eval` is the user-facing command name; the builtin i
     train_split: float | None = typer.Option(
         None, help="Train/holdout ratio per file (default: 0.7, or suite config)."
     ),
+    val_frac: float | None = typer.Option(
+        None,
+        "--val-frac",
+        help="`wmh eval grid`: validation fraction reserved for GEPA in a 3-way split so cells "
+        "score only the leak-free test band (default: (1 - train_split)/2, matching build).",
+    ),
     embed_dim: int | None = typer.Option(
         None, help="phi dimensionality for the offline embedder (default: 512, or suite config)."
     ),
@@ -785,6 +793,23 @@ def eval_(  # noqa: A001 - `eval` is the user-facing command name; the builtin i
         f"{ARTIFACT_DIR}/evals", help="Local directory for named eval result JSON."
     ),
     limit: int = typer.Option(20, help="Rows to show for `wmh eval results`."),
+    models: str | None = typer.Option(
+        None,
+        help="`wmh eval grid`: comma-separated Label:provider:model cells "
+        "(e.g. 'Opus 4.8:bedrock:us.anthropic.claude-opus-4-8,GPT-5.5:openai:gpt-5.5').",
+    ),
+    gepa_prompts: str | None = typer.Option(
+        None, help="`wmh eval grid`: dir of <label>.txt evolved prompts (enables +GEPA cells)."
+    ),
+    dataset_label: str | None = typer.Option(
+        None, help="`wmh eval grid`: dataset name for the chart subtitle (default: suite id)."
+    ),
+    limit_traces: int | None = typer.Option(
+        None, help="`wmh eval grid`: cap test traces (dry-run). Default: all."
+    ),
+    judge_model: str = typer.Option(
+        "us.anthropic.claude-opus-4-8", help="`wmh eval grid`: pinned judge model (Bedrock)."
+    ),
     name: str | None = typer.Option(
         None, "--name", help="World model for --mode closed-loop (default: the only built one)."
     ),
@@ -879,6 +904,40 @@ def eval_(  # noqa: A001 - `eval` is the user-facing command name; the builtin i
             raise typer.BadParameter("usage: wmh eval results [suite]")
         suite_filter = args[1] if len(args) == 2 else None
         _eval_results(results_root, suite_roots, suite_filter, limit=limit)
+        return
+    if args and args[0] == "grid":
+        if len(args) != 2:
+            raise typer.BadParameter("usage: wmh eval grid <suite>")
+        _eval_run_grid(
+            args[1],
+            examples_roots=suite_roots,
+            results_root=results_root,
+            models=models,
+            gepa_prompts=gepa_prompts,
+            dataset_label=dataset_label,
+            limit_traces=limit_traces,
+            judge_model=judge_model,
+            region=region,
+            train_split=train_split,
+            seed=seed,
+            top_k=top_k,
+            embed_dim=embed_dim,
+            sample_turns=sample_turns,
+            val_frac=val_frac,
+            out=out,
+        )
+        return
+    if args and args[0] == "grid-plot":
+        if len(args) < 2:
+            raise typer.BadParameter("usage: wmh eval grid-plot <result.json> [<result.json>...]")
+        _eval_grid_plot(args[1:], out=out, dataset_label=dataset_label)
+        return
+    if args and args[0] == "grid-heatmap":
+        if len(args) < 2:
+            raise typer.BadParameter(
+                "usage: wmh eval grid-heatmap <result.json> [<result.json>...]"
+            )
+        _eval_grid_heatmap(args[1:], out=out)
         return
     if args and args[0] == "run":
         if len(args) != 2:
@@ -1001,6 +1060,170 @@ def _eval_results(
             str(summary.path),
         )
     _console.print(table)
+
+
+# Default grid: one bar family per serving model. Qwen-AgentWorld is self-hosted (openai-compatible
+# vLLM via OPENAI_BASE_URL); the rest are frontier models the registry builds directly.
+_DEFAULT_GRID_MODELS = (
+    "Opus 4.8:bedrock:us.anthropic.claude-opus-4-8",
+    "Haiku 4.5:bedrock:us.anthropic.claude-haiku-4-5-20251001-v1:0",
+    "GPT-5.5:openai:gpt-5.5",
+    "GPT-5.4 Mini:openai:gpt-5.4-mini",
+    "Qwen-AgentWorld:openai:Qwen/Qwen-AgentWorld-35B-A3B",
+)
+
+
+def _parse_model_specs(models: str | None) -> list[ModelSpec]:
+    """Parse "Label:provider:model[,...]" into ModelSpecs (default set when None).
+
+    The provider is validated and the model resolved through the shared catalog
+    (`resolve_provider_model`), so a friendly model type resolves to its canonical wire id while an
+    unknown (self-hosted) id passes through unchanged, and a bad provider fails at parse time.
+    """
+    raw = models.split(",") if models else list(_DEFAULT_GRID_MODELS)
+    specs: list[ModelSpec] = []
+    for entry in raw:
+        parts = entry.split(":", 2)
+        if len(parts) != 3 or not all(p.strip() for p in parts):
+            raise typer.BadParameter(f"bad --models entry {entry!r}; want 'Label:provider:model'")
+        label, provider_str, model_str = (p.strip() for p in parts)
+        try:
+            kind = ProviderKind(provider_str)
+        except ValueError:
+            kinds = ", ".join(k.value for k in ProviderKind)
+            raise typer.BadParameter(
+                f"unknown provider {provider_str!r} in --models {entry!r}; want one of {kinds}"
+            ) from None
+        specs.append(ModelSpec(label, kind.value, resolve_provider_model(kind, model_str).model_id))
+    return specs
+
+
+def _grid_output_paths(out: str | None, default_json: Path) -> tuple[Path, Path]:
+    """Result-JSON and chart-PNG destinations for a grid run.
+
+    With `--out`, the JSON and PNG share the stem but ALWAYS take distinct suffixes, so passing
+    `--out foo.json` can never make the PNG write clobber the result JSON at the same path (and
+    `--out foo.png` still lands the JSON next to it). Without `--out`, use the default JSON dest and
+    its `.png` sibling.
+    """
+    if out is None:
+        return default_json, default_json.with_suffix(".png")
+    base = Path(out)
+    return base.with_suffix(".json"), base.with_suffix(".png")
+
+
+def _eval_run_grid(  # noqa: PLR0913 - a CLI seam threading grid options; each maps to one flag
+    selector: str,
+    *,
+    examples_roots: list[str],
+    results_root: str,
+    models: str | None,
+    gepa_prompts: str | None,
+    dataset_label: str | None,
+    limit_traces: int | None,
+    judge_model: str,
+    region: str | None,
+    train_split: float | None,
+    seed: int | None,
+    top_k: int | None,
+    embed_dim: int | None,
+    sample_turns: str | None,
+    val_frac: float | None,
+    out: str | None,
+) -> None:
+    """Run the model x condition grid for a suite, write result JSON + a fidelity bar chart PNG."""
+    suite = resolve_eval_suite(selector, examples_roots)
+    specs = _parse_model_specs(models)
+    prompt_dir = Path(gepa_prompts) if gepa_prompts else None
+    prompt_map: dict[str, str] | None = None
+    if prompt_dir is not None:
+        prompt_map = {
+            s.label: str(prompt_dir / f"{s.label}.txt")
+            for s in specs
+            if (prompt_dir / f"{s.label}.txt").exists()
+        }
+    cfg = suite.config
+    result = run_grid(
+        suite_name=suite.id,
+        files=[str(p) for p in suite.resolve_files()],
+        models=specs,
+        gepa_prompts=prompt_map,
+        base_prompt=BASE_ENV_PROMPT,
+        judge_provider="bedrock",
+        judge_model=judge_model,
+        judge_region=region,
+        train_split=train_split if train_split is not None else cfg.train_split,
+        val_frac=val_frac,
+        top_k=top_k if top_k is not None else cfg.top_k,
+        seed=seed if seed is not None else cfg.seed,
+        sample_turns=sample_turns or cfg.sample_turns,
+        embed_dim=embed_dim if embed_dim is not None else cfg.embed_dim,
+        max_holdout_traces=limit_traces,
+    )
+    for cell in result.cells:
+        cost = f" ${cell.cost_usd:.2f}" if cell.cost_usd else ""
+        _console.print(
+            f"  {cell.model_label:16} {cell.condition_label:14} "
+            f"fidelity={cell.fidelity:.3f} err_flag={cell.error_flag_acc:.3f} "
+            f"n={cell.n_steps}{cost}"
+        )
+    run_id = uuid4().hex
+    default_dest = Path(results_root) / "grid" / f"{suite.name}-{run_id}.json"
+    dest, png = _grid_output_paths(out, default_dest)
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    dest.write_text(result.model_dump_json(indent=2), encoding="utf-8")
+    _console.print(f"wrote grid result -> {dest}")
+    png.parent.mkdir(parents=True, exist_ok=True)
+    plot_grid(
+        result,
+        png,
+        dataset_label=dataset_label or suite.id,
+        n_test_traces=result.total_test_traces,
+    )
+    _console.print(f"wrote grid chart  -> {png}")
+
+
+def _eval_grid_plot(paths: list[str], *, out: str | None, dataset_label: str | None) -> None:
+    """Merge one or more grid result JSONs and render a single combined fidelity chart.
+
+    Lets a self-hosted model's grid (run in its own process, since its OpenAI base URL is
+    process-global) be combined with the API-model grid into one chart - and re-plots any saved
+    result without re-running the eval.
+    """
+    results = [GridResult.model_validate_json(Path(p).read_text(encoding="utf-8")) for p in paths]
+    merged = merge_results(results)
+    for cell in merged.cells:
+        cost = f" ${cell.cost_usd:.2f}" if cell.cost_usd else ""
+        _console.print(
+            f"  {cell.model_label:16} {cell.condition_label:14} "
+            f"fidelity={cell.fidelity:.3f} err_flag={cell.error_flag_acc:.3f} "
+            f"n={cell.n_steps}{cost}"
+        )
+    # Force a .png suffix so `--out foo.json` writes a real PNG file, never a PNG mislabeled .json.
+    png = Path(out).with_suffix(".png") if out else Path(paths[0]).with_suffix(".merged.png")
+    plot_grid(
+        merged,
+        png,
+        dataset_label=dataset_label or merged.suite,
+        n_test_traces=merged.total_test_traces,
+    )
+    _console.print(f"wrote merged grid chart -> {png}")
+
+
+def _eval_grid_heatmap(paths: list[str], *, out: str | None) -> None:
+    """Render the whole grid as one heatmap from result JSONs (merged per suite).
+
+    Accepts any mix of API/Qwen result JSONs; same-suite results are merged into one 5-model row
+    set, then all suites become the heatmap's columns (rows = model x condition).
+    """
+    by_suite: dict[str, list[GridResult]] = {}
+    for p in paths:
+        res = GridResult.model_validate_json(Path(p).read_text(encoding="utf-8"))
+        by_suite.setdefault(res.suite, []).append(res)
+    merged = {suite: merge_results(rs) for suite, rs in by_suite.items()}
+    png = Path(out).with_suffix(".png") if out else Path("grid-heatmap.png")
+    plot_grid_heatmap(merged, png)
+    _console.print(f"wrote grid heatmap -> {png} ({len(merged)} benchmarks)")
 
 
 def _eval_run_suite(

@@ -268,7 +268,22 @@ def _score_step(
     escalate_below: float | None = None,
     max_retrieved_observation_chars: int | None = None,
 ) -> StepResult:
-    """Predict the observation for one step and score it against the recorded observation."""
+    """Predict the observation for one step and score it against the recorded observation.
+
+    Two failure modes are handled DIFFERENTLY on purpose:
+
+    - A *draft prediction* failure (the target times out / throttles / errors and never produces an
+      observation) is a genuine fidelity failure: it scores 0.0 with `valid=True` (counted in the
+      mean) rather than aborting the whole run - one stalled target request must not throw away
+      every other step. ONLY the draft `_predict(provider)` is guarded.
+    - *Escalation* and *verify* failures are NOT caught: a systematic failure there (a broken
+      escalate_provider or verify pass) aborts loudly rather than being laundered into counted 0.0s
+      that silently depress the fidelity mean.
+    - A *judge* failure is NOT caught here. A malformed reply already comes back as `valid=False`
+      (excluded from aggregates); a judge call that RAISES (throttle/5xx after its own fallover)
+      propagates and aborts the eval on purpose - a partially judged run would silently change what
+      the fidelity mean is over. The grid guards against this with the judge's same-model fallover.
+    """
     step_demos = demos.demos_for(trace_id, step)
     step_knowledge = prefetched_knowledge(knowledge, step.action, grounder)
     prior_actions = [h.action for h in history]
@@ -308,7 +323,27 @@ def _score_step(
             max_retrieved_observation_chars=max_retrieved_observation_chars,
         )
 
-    predicted = _predict(provider)
+    # Guard ONLY the draft target prediction: a target that times out / throttles / errors and
+    # never produces an observation is a real fidelity 0 for this step (valid=True, counted),
+    # not a run abort - one stalled request must not throw away every other step. Escalation and
+    # verify are deliberately NOT guarded: a systematic failure there (a misconfigured
+    # escalate_provider or verify pass) should surface loudly by aborting, not be laundered into a
+    # counted 0.0 that silently depresses the fidelity mean. The judge call is also outside (see
+    # the docstring).
+    try:
+        predicted = _predict(provider)
+    except Exception as exc:  # noqa: BLE001 - a target draft failure is a 0, not a crash
+        return StepResult(
+            trace_id=trace_id,
+            task=step.task,
+            action=render_action(step.action),
+            actual=step.observation.content,
+            predicted="",
+            score=0.0,
+            critique=f"prediction failed: {type(exc).__name__}: {str(exc)[:200]}",
+            is_error_actual=step.observation.is_error,
+            is_error_predicted=False,
+        )
     escalated = False
     if (
         escalate_provider is not None
@@ -319,9 +354,9 @@ def _score_step(
         escalated = True
     should_verify = verify or (verify_below is not None and _below(predicted, verify_below))
     if should_verify:
-        # The reviser must be the model whose draft is being kept: letting the cheap model
-        # revise an escalated (strong-model) prediction would silently undo the escalation on
-        # exactly the hard steps it was bought for.
+        # The reviser must be the model whose draft is being kept: letting the cheap model revise
+        # an escalated (strong-model) prediction would silently undo the escalation on exactly the
+        # hard steps it was bought for.
         reviser = escalate_provider if escalated and escalate_provider is not None else provider
         predicted = verify_observation(
             reviser,

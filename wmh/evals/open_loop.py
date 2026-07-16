@@ -15,7 +15,7 @@ from statistics import fmean, pstdev
 
 from pydantic import BaseModel, Field
 
-from wmh.engine.build import split_traces
+from wmh.engine.build import split_traces, split_traces_3way
 from wmh.engine.knowledge import seeded_knowledge_text
 from wmh.engine.replay import ReplayReport, replay, valid_scores
 from wmh.ingest import get_adapter
@@ -63,10 +63,12 @@ def evaluate_files(
     *,
     embedder: Embedder | None = None,
     train_split: float = 0.7,
+    val_frac: float | None = None,
     top_k: int = 5,
     sample_turns: str = "all",
     seed: int = 0,
     adapter_name: str = "otel-genai",
+    max_holdout_traces: int | None = None,
     knowledge: bool = False,
     reasoning: bool = False,
 ) -> EvalReport:
@@ -74,9 +76,17 @@ def evaluate_files(
 
     Each file is split deterministically; tiny corpora with no held-out trace fall back to scoring
     every trace. RAG, when enabled, retrieves from that file's own train split only (leak-free).
-    `sample_turns`/`seed` are forwarded to `replay` (see its docstring).
+    `sample_turns`/`seed` are forwarded to `replay` (see its docstring). `max_holdout_traces` caps
+    how many held-out traces are scored per file (a deterministic prefix by trace_id) - for cheap
+    dry-runs; the train side stays full so retrieval is unaffected.
 
-    `knowledge` seeds an ephemeral knowledge base from each file's TRAIN split (never the holdout —
+    `val_frac` makes the split leak-free against a GEPA-evolved prompt: when it is a positive
+    fraction, the traces are cut 3-way (`train`/`val`/`test`) on the same hash line GEPA used, and
+    only the reserved `test` band is scored, so a prompt selected on `val` is never graded on those
+    same traces. Retrieval still draws from `train` only. `val_frac` of `None` or `0` keeps the
+    plain 2-way `train`/held-out split (`split_traces_3way` requires a strictly positive band).
+
+    `knowledge` seeds an ephemeral knowledge base from each file's TRAIN split (never the holdout -
     the same leak-free discipline as RAG) and renders it into every prediction; `reasoning`
     switches predictions to the deliberate-then-answer contract. Both mirror the serving engine's
     agentic mode. Closed-loop evals get agentic mode from the ARTIFACT instead (the served
@@ -88,9 +98,14 @@ def evaluate_files(
         traces = adapter.from_file(str(path))
         if not traces:
             continue
-        train, holdout = split_traces(traces, train_split)
+        if val_frac:  # truthy (a positive val band); None or 0.0 keeps the plain 2-way split
+            train, _val, holdout = split_traces_3way(traces, train_split, val_frac)
+        else:
+            train, holdout = split_traces(traces, train_split)
         if not holdout:  # tiny corpus: evaluate on everything
             train, holdout = traces, traces
+        if max_holdout_traces is not None:
+            holdout = sorted(holdout, key=lambda t: t.trace_id)[:max_holdout_traces]
         retriever = EmbeddingRetriever(embedder) if embedder is not None else None
         # Ephemeral, per-file, train-only KB: rendered text only — nothing under models/ is read
         # or written, so eval can never leak a serve-time learned.md into scoring.

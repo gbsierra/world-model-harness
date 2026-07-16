@@ -213,6 +213,15 @@ def build(
         # tier may widen it (`gepa_val_cap`, in steps).
         gepa_val = _cap_gepa_valset(val or train, gepa_val_cap or _GEPA_VAL_STEP_CAP)
         result = optimizer.optimize(train, gepa_val, BASE_ENV_PROMPT, config.gepa_budget)
+        # A GEPA candidate can be empty - a weak reflection LM (e.g. a self-reflecting open model)
+        # sometimes proposes a blank env prompt that still scores acceptably on easy steps and
+        # gets selected. An empty env prompt is never a valid artifact, so fall back to base.
+        if not result.prompt.strip():
+            result = OptimizeResult(
+                prompt=BASE_ENV_PROMPT,
+                frontier=result.frontier or [BASE_ENV_PROMPT],
+                metrics=result.metrics,
+            )
     report.optimize_done(
         result.metrics.held_out_accuracy, len(result.frontier), result.metrics.rollouts_used
     )

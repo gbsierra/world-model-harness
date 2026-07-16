@@ -31,3 +31,4 @@ file here must justify its existence in the table below; a doc that can't gets d
 | `research/confidence_gated_frontier.png` | The one figure the writeup renders: the gated-verify cost frontier (fidelity vs $/cell, never/gated/always) — the headline Pareto claim. |
 | `reference/eval_suites.md` | The reproducibility contract every benchmark number in this repo rests on (`examples/<task>/evals/*.toml` + `wmh eval`); commands verified against `main` at promotion. |
 | `reference/failover.md` | The `.wmh/fallback.toml` failover contract: which calls ride the chain (world-model) and which never do (the judge), plus the cross-account ladder format; verified live against both AWS accounts. |
+| `reference/eval_grid.md` | `wmh eval grid` - the model × condition fidelity grid (base/+RAG/+GEPA/+GEPA+RAG across models, one pinned judge, target-side cost); commands + judge version self-contained; fresh results land in `.wmh/evals/grid/`. |
