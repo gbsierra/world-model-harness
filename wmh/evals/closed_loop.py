@@ -16,20 +16,31 @@ The environment is a factory parameter: `evaluate_closed_loop` binds it to the w
 from __future__ import annotations
 
 from collections.abc import Callable
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from statistics import fmean, pstdev
 
 from pydantic import BaseModel, Field
 
+from wmh.core.text import normalize_durable_text
 from wmh.core.types import Action, Observation
 from wmh.engine.world_model import WorldModel
 from wmh.evals.gold import GoldJudge, GoldVerdict
 from wmh.evals.tasks import TaskSpec
 from wmh.harness.environment import AgentEnvironment
-from wmh.harness.runtime import AgentRuntime, RunResult, Runtime, TokenUsage, combine_usage
+from wmh.harness.runtime import (
+    AgentRuntime,
+    RunResult,
+    Runtime,
+    RuntimeCancelled,
+    StopReason,
+    TokenUsage,
+    combine_usage,
+)
 from wmh.providers.base import Provider
 
 DEFAULT_K = 3  # eval-reporting convention: every metric is the mean of k passes, never single-pass
+_ROLLOUT_EVIDENCE_CHARS = 12_000
+_ROLLOUT_ANSWER_CHARS = 4_000
 
 # Opens a fresh environment for one task. The world-model backend and any real backend both fit
 # this shape, which is what lets the SAME scoring core measure simulation and reality.
@@ -64,6 +75,21 @@ class WorldModelEnvironment:
             self._closed = True
 
 
+class RolloutEvidence(BaseModel):
+    """The execution evidence behind one judged pass.
+
+    Aggregate scores are sufficient for ranking, but not for improving a harness: the proposer
+    needs to see what the agent actually tried, what the environment returned, and why the run
+    stopped. Keeping this alongside each verdict lets every optimizer backend expose the same
+    trace-level feedback without reaching into a platform-specific rollout store.
+    """
+
+    answer: str = ""
+    transcript: str = ""
+    stop_reason: StopReason
+    turns: int = 0
+
+
 class TaskOutcome(BaseModel):
     """One task's closed-loop result across k passes."""
 
@@ -72,6 +98,7 @@ class TaskOutcome(BaseModel):
     mean_fraction: float = 0.0  # mean fraction-of-assertions across passes (partial credit)
     passes: int = 0
     verdicts: list[GoldVerdict] = Field(default_factory=list)
+    attempts: list[RolloutEvidence] = Field(default_factory=list)
 
 
 class ClosedLoopReport(BaseModel):
@@ -114,6 +141,7 @@ def evaluate_with_env(
     k: int = DEFAULT_K,
     concurrency: int = 1,
     on_progress: Callable[[str, int, GoldVerdict], None] | None = None,
+    should_cancel: Callable[[], bool] | None = None,
 ) -> ClosedLoopReport:
     """Score the agent on `tasks` against whatever env `make_env` opens, k passes per task.
 
@@ -128,27 +156,40 @@ def evaluate_with_env(
     per_task: dict[str, TaskOutcome] = {}
     usages: list[TokenUsage | None] = []
     if concurrency != 0 and concurrency <= 1:
-        for task in tasks:
-            verdicts: list[GoldVerdict] = []
-            for attempt in range(k):
-                result = _run_once(task, make_env, runtime)
-                usages.append(result.worker_usage)
-                verdict = judge.score(
-                    task.instruction, result.answer, result.transcript(), task.gold
+        try:
+            for task in tasks:
+                verdicts: list[GoldVerdict] = []
+                attempts: list[RolloutEvidence] = []
+                for attempt in range(k):
+                    _check_cancelled(should_cancel)
+                    result = _run_once(task, make_env, runtime)
+                    # Record the episode before the next cancellation boundary. If
+                    # cancellation landed during the bounded worker call, RunnerLink
+                    # raises with that episode's partial usage instead.
+                    usages.append(result.worker_usage)
+                    attempts.append(_rollout_evidence(result))
+                    _check_cancelled(should_cancel)
+                    verdict = judge.score(
+                        task.instruction, result.answer, result.transcript(), task.gold
+                    )
+                    _check_cancelled(should_cancel)
+                    verdicts.append(verdict)
+                    if on_progress is not None:
+                        on_progress(task.task_id, attempt + 1, verdict)
+                successes = [1.0 if v.passed else 0.0 for v in verdicts]
+                per_task[task.task_id] = TaskOutcome(
+                    task_id=task.task_id,
+                    success_rate=fmean(successes),
+                    mean_fraction=fmean(v.fraction for v in verdicts),
+                    passes=k,
+                    verdicts=verdicts,
+                    attempts=attempts,
                 )
-                verdicts.append(verdict)
-                if on_progress is not None:
-                    on_progress(task.task_id, attempt + 1, verdict)
-            successes = [1.0 if v.passed else 0.0 for v in verdicts]
-            per_task[task.task_id] = TaskOutcome(
-                task_id=task.task_id,
-                success_rate=fmean(successes),
-                mean_fraction=fmean(v.fraction for v in verdicts),
-                passes=k,
-                verdicts=verdicts,
-            )
+        except RuntimeCancelled as error:
+            error.worker_usage = combine_usage([*usages, error.worker_usage])
+            raise
     else:
-        by_cell, usages = _run_cells_concurrently(
+        by_cell, usages, evidence_by_cell = _run_cells_concurrently(
             tasks,
             make_env,
             runtime,
@@ -156,9 +197,11 @@ def evaluate_with_env(
             k=k,
             concurrency=concurrency,
             on_progress=on_progress,
+            should_cancel=should_cancel,
         )
         for index, task in enumerate(tasks):
             verdicts = by_cell[index * k : (index + 1) * k]  # cells are task-major, attempt-minor
+            attempts = evidence_by_cell[index * k : (index + 1) * k]
             successes = [1.0 if v.passed else 0.0 for v in verdicts]
             per_task[task.task_id] = TaskOutcome(
                 task_id=task.task_id,
@@ -166,6 +209,7 @@ def evaluate_with_env(
                 mean_fraction=fmean(v.fraction for v in verdicts),
                 passes=k,
                 verdicts=verdicts,
+                attempts=attempts,
             )
 
     task_rates = [o.success_rate for o in per_task.values()]
@@ -191,6 +235,7 @@ def evaluate_closed_loop(
     concurrency: int = 1,
     runtime: Runtime | None = None,
     on_progress: Callable[[str, int, GoldVerdict], None] | None = None,
+    should_cancel: Callable[[], bool] | None = None,
 ) -> ClosedLoopReport:
     """Score the fixed agent on `tasks` against `world_model` (`wmh eval --mode closed-loop`).
 
@@ -210,6 +255,7 @@ def evaluate_closed_loop(
             k=k,
             concurrency=concurrency,
             on_progress=on_progress,
+            should_cancel=should_cancel,
         )
 
     if concurrency == 1:
@@ -267,6 +313,34 @@ def _run_once(task: TaskSpec, make_env: EnvFactory, runtime: Runtime) -> RunResu
         env.close()
 
 
+def _rollout_evidence(result: RunResult) -> RolloutEvidence:
+    """Freeze the proposer-facing parts of a run before its environment is gone."""
+    return RolloutEvidence(
+        answer=_bounded_evidence_text(
+            normalize_durable_text(result.answer),
+            _ROLLOUT_ANSWER_CHARS,
+            label="answer",
+        ),
+        transcript=_bounded_evidence_text(
+            normalize_durable_text(result.transcript()),
+            _ROLLOUT_EVIDENCE_CHARS,
+            label="trace",
+        ),
+        stop_reason=result.stop_reason,
+        turns=result.turns,
+    )
+
+
+def _bounded_evidence_text(content: str, limit: int, *, label: str) -> str:
+    """Retain the beginning and terminal behavior without unbounded report memory."""
+    if len(content) <= limit:
+        return content
+    head = limit // 2
+    tail = limit - head
+    omitted = len(content) - limit
+    return f"{content[:head]}\n... ({omitted} {label} characters omitted) ...\n{content[-tail:]}"
+
+
 def _run_cells_concurrently(
     tasks: list[TaskSpec],
     make_env: EnvFactory,
@@ -276,49 +350,131 @@ def _run_cells_concurrently(
     k: int,
     concurrency: int,
     on_progress: Callable[[str, int, GoldVerdict], None] | None,
-) -> tuple[list[GoldVerdict], list[TokenUsage | None]]:
+    should_cancel: Callable[[], bool] | None,
+) -> tuple[list[GoldVerdict], list[TokenUsage | None], list[RolloutEvidence]]:
     """Run every (task, attempt) cell on a thread pool; verdicts return in cell order.
 
     Cell order is task-major, attempt-minor — the exact order the sequential loop visits — so the
     caller can slice per task and aggregate deterministically. `on_progress` fires from THIS
     thread as futures land (gepa.py precedent: UI callbacks must be a serial stream). A rollout or
     judge call that raises is a real failure: pending cells are cancelled and the exception
-    propagates IMMEDIATELY (fail-fast, scenario_fidelity precedent) — never swallowed into a
-    verdict, and never held back while in-flight cells (minutes-long sandbox rollouts) drain:
-    the pool is shut down with wait=False, so still-running cells finish on their own threads
-    and release their environments through `_run_once`'s finally.
+    propagates after owned work drains — never swallowed into a verdict. Any failure drains
+    already-started cells before returning while cancelling cells
+    that have not started: those threads can still own billable provider calls, rollout
+    persistence, and sandbox leases, so the caller must not terminalize the enclosing run while
+    they remain active. Every cell releases its environment through ``_run_once``'s ``finally``.
     """
     cells = [(task, attempt) for task in tasks for attempt in range(k)]
     if not cells:
-        return [], []
+        return [], [], []
     max_workers = len(cells) if concurrency == 0 else min(concurrency, len(cells))
     slots: list[GoldVerdict | None] = [None] * len(cells)
     usage_slots: list[TokenUsage | None] = [None] * len(cells)
+    evidence_slots: list[RolloutEvidence | None] = [None] * len(cells)
 
-    def run_cell(task: TaskSpec) -> tuple[GoldVerdict, TokenUsage | None]:
+    def run_cell(
+        task: TaskSpec,
+    ) -> tuple[GoldVerdict, TokenUsage | None, RolloutEvidence]:
+        _check_cancelled(should_cancel)
         result = _run_once(task, make_env, runtime)
-        verdict = judge.score(task.instruction, result.answer, result.transcript(), task.gold)
-        return verdict, result.worker_usage
+        try:
+            _check_cancelled(should_cancel)
+            verdict = judge.score(task.instruction, result.answer, result.transcript(), task.gold)
+            _check_cancelled(should_cancel)
+        except RuntimeCancelled as error:
+            # The rollout finished before cancellation, even though its verdict
+            # did not. Preserve that worker spend for the coordinator's drain.
+            error.worker_usage = combine_usage([result.worker_usage, error.worker_usage])
+            raise
+        return verdict, result.worker_usage, _rollout_evidence(result)
 
     pool = ThreadPoolExecutor(max_workers=max_workers)
     try:
         futures = {pool.submit(run_cell, task): i for i, (task, _attempt) in enumerate(cells)}
-        for future in as_completed(futures):
-            index = futures[future]
-            verdict, usage = future.result()  # a raised rollout/judge exception propagates here
-            slots[index] = verdict
-            usage_slots[index] = usage
-            if on_progress is not None:
-                task, attempt = cells[index]
-                on_progress(task.task_id, attempt + 1, verdict)
-    except BaseException:
-        pool.shutdown(wait=False, cancel_futures=True)
+        pending = set(futures)
+        while pending:
+            done, pending = wait(pending, timeout=0.25, return_when=FIRST_COMPLETED)
+            # Do not rely on a cell reaching RunnerLink before noticing API cancellation: all
+            # cells may still be inside cold E2B startup. This caller-side poll aborts the shared
+            # runtime below, which closes registered sandboxes before the ownership drain.
+            _check_cancelled(should_cancel)
+            for future in sorted(done, key=futures.__getitem__):
+                index = futures[future]
+                verdict, usage, evidence = (
+                    future.result()
+                )  # a rollout/judge exception propagates here
+                slots[index] = verdict
+                usage_slots[index] = usage
+                evidence_slots[index] = evidence
+                if on_progress is not None:
+                    task, attempt = cells[index]
+                    on_progress(task.task_id, attempt + 1, verdict)
+    except BaseException as error:
+        cancelled = isinstance(error, RuntimeCancelled)
+        if not cancelled and isinstance(error, Exception) and should_cancel is not None:
+            try:
+                cancelled = should_cancel()
+            except Exception:  # noqa: BLE001 - preserve the cell's original failure
+                pass
+        abort_error: BaseException | None = None
+        abort = getattr(runtime, "abort", None)
+        if callable(abort):
+            try:
+                abort()
+            except BaseException as candidate:  # noqa: BLE001 - cleanup must survive the drain
+                abort_error = candidate
+        pool.shutdown(wait=True, cancel_futures=True)
+        if abort_error is not None and callable(abort):
+            # A worker's release() during the drain may have retried and proved the exact lease
+            # whose first abort failed. Re-run the idempotent close before declaring a leak.
+            try:
+                abort()
+            except BaseException as candidate:  # noqa: BLE001 - this is the final cleanup proof
+                abort_error = candidate
+            else:
+                abort_error = None
+        cancelled_error: RuntimeCancelled | None = None
+        if cancelled:
+            # Every started future is done after shutdown(wait=True). Collect
+            # successful episode usage and partial usage carried by cancelled
+            # episodes exactly once, including futures the coordinator had not
+            # observed before the cancellation boundary.
+            partial_usages: list[TokenUsage | None] = []
+            for future in futures:
+                if future.cancelled():
+                    continue
+                try:
+                    _verdict, usage, _evidence = future.result()
+                except RuntimeCancelled as candidate:
+                    partial_usages.append(candidate.worker_usage)
+                except BaseException:  # noqa: BLE001 - original error remains authoritative
+                    continue
+                else:
+                    partial_usages.append(usage)
+            if isinstance(error, RuntimeCancelled):
+                cancelled_error = error
+            else:
+                cancelled_error = RuntimeCancelled("runtime evaluation cancelled")
+            cancelled_error.worker_usage = combine_usage(partial_usages)
+        if abort_error is not None:
+            raise abort_error from (cancelled_error or error)
+        if cancelled_error is not None and cancelled_error is not error:
+            raise cancelled_error from error
         raise
     else:
         pool.shutdown(wait=True)
     verdicts: list[GoldVerdict] = []
-    for slot in slots:
+    attempts: list[RolloutEvidence] = []
+    for slot, evidence in zip(slots, evidence_slots, strict=True):
         if slot is None:  # pragma: no cover - every future completed, or we raised above
             raise RuntimeError("a cell completed without producing a verdict")
+        if evidence is None:  # pragma: no cover - same future produced both values atomically
+            raise RuntimeError("a cell completed without preserving rollout evidence")
         verdicts.append(slot)
-    return verdicts, usage_slots
+        attempts.append(evidence)
+    return verdicts, usage_slots, attempts
+
+
+def _check_cancelled(should_cancel: Callable[[], bool] | None) -> None:
+    if should_cancel is not None and should_cancel():
+        raise RuntimeCancelled("runtime evaluation cancelled")

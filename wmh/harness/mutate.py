@@ -15,15 +15,21 @@ iteration; a flaky meta-model costs budget, not the run.
 
 from __future__ import annotations
 
+import json
+
 from pydantic import BaseModel, Field, ValidationError
 
 from wmh.core.parsing import extract_json_object
-from wmh.evals.closed_loop import ClosedLoopReport
+from wmh.core.text import normalize_durable_text
+from wmh.evals.closed_loop import ClosedLoopReport, RolloutEvidence
+from wmh.evals.gold import GoldVerdict
 from wmh.evals.tasks import TaskSpec
 from wmh.harness.delta import FailureSignature, HarnessDelta, SurfaceOp, compute_delta_id
 from wmh.harness.doc import HarnessDoc
 from wmh.harness.tools import SUBMIT, TOOL_REGISTRY
 from wmh.providers.base import Message, Provider
+
+_TRACE_CHARS_PER_ATTEMPT = 12_000
 
 MUTATE_SYSTEM = f"""You are a meta-agent improving an agent harness — a document of named \
 SURFACES that configure an agent. You do NOT solve the agent's tasks yourself. You are shown the \
@@ -63,7 +69,8 @@ Surface kinds:
 - tool_policy — the tool list, one tool name per line. Valid names: \
 {", ".join(sorted(TOOL_REGISTRY))}. The `{SUBMIT.name}` tool is REQUIRED (without it a run \
 cannot end).
-- param — a scalar loop knob: `param:max-turns` (int >= 1), `param:temperature` (float in [0, 2]).
+- param — a scalar loop knob: `param:max-turns` (int >= 1), `param:max-output-tokens` for a
+  `pi-node` harness (int >= 1), or `param:temperature` (float in [0, 2]).
 - code — the agent's source. Either the singleton in-process `code:runtime` (contract above; must
   compile and define `run`), OR the pathful `code:<...>` files of a real multi-file harness (the
   vendored pi agent's own source). Editing a pathful `code:` surface REPLACES that file's whole
@@ -125,21 +132,72 @@ def propose_delta(
         temperature=0.9,
         max_tokens=16384,
     )
-    raw = extract_json_object(completion.text)
+    return parse_delta(parent, trigger, completion.text)
+
+
+def parse_delta(
+    parent: HarnessDoc,
+    trigger: FailureSignature,
+    text: str,
+) -> HarnessDelta | None:
+    """Parse one full-content or compact-edit proposal against ``parent``."""
+    raw = extract_json_object(text)
     if raw is None:
         return None
     try:
-        proposed = _RawDelta.model_validate_json(raw)
-    except ValidationError:
+        value = json.loads(raw)
+        if not isinstance(value, dict):
+            return None
+        value["ops"] = _expand_compact_ops(parent, value.get("ops"))
+        proposed = _RawDelta.model_validate(value)
+        return HarnessDelta(
+            delta_id=compute_delta_id(parent.doc_hash, proposed.ops),
+            parent_doc_hash=parent.doc_hash,
+            trigger=trigger,
+            preconditions=proposed.preconditions,
+            ops=proposed.ops,
+            expected_effect=proposed.expected_effect,
+        )
+    except (TypeError, ValueError, ValidationError):
         return None
-    return HarnessDelta(
-        delta_id=compute_delta_id(parent.doc_hash, proposed.ops),
-        parent_doc_hash=parent.doc_hash,
-        trigger=trigger,
-        preconditions=proposed.preconditions,
-        ops=proposed.ops,
-        expected_effect=proposed.expected_effect,
-    )
+
+
+def _expand_compact_ops(parent: HarnessDoc, value: object) -> list[dict[str, object]]:
+    """Expand exact replacement hunks into ordinary full-content surface ops."""
+    if not isinstance(value, list):
+        raise ValueError("ops must be an array")
+    expanded: list[dict[str, object]] = []
+    for item in value:
+        if not isinstance(item, dict):
+            raise ValueError("each op must be an object")
+        op = dict(item)
+        edits = op.pop("edits", None)
+        if op.get("op") == "replace" and "content" not in op and edits is not None:
+            surface_id = op.get("surface_id")
+            if not isinstance(surface_id, str) or (surface := parent.surface(surface_id)) is None:
+                raise ValueError("compact replace targets an unknown surface")
+            op["content"] = _apply_edits(surface.content, edits)
+        elif edits is not None:
+            raise ValueError("edits are only valid on content-less replace ops")
+        expanded.append(op)
+    return expanded
+
+
+def _apply_edits(content: str, value: object) -> str:
+    """Apply ordered exact edits, rejecting missing or ambiguous anchors."""
+    if not isinstance(value, list) or not value:
+        raise ValueError("edits must be a non-empty array")
+    for item in value:
+        if not isinstance(item, dict):
+            raise ValueError("each edit must be an object")
+        old = item.get("old")
+        new = item.get("new")
+        if not isinstance(old, str) or not old or not isinstance(new, str):
+            raise ValueError("edits need non-empty old and string new values")
+        if content.count(old) != 1:
+            raise ValueError("edit old text must occur exactly once")
+        content = content.replace(old, new, 1)
+    return content
 
 
 def render_evidence(
@@ -159,16 +217,91 @@ def render_evidence(
             "distilled from what worked."
         )
     by_id = {task.task_id: task for task in tasks}
-    sections = [f"Failure mechanism: {trigger.mechanism}"]
+    selected = set(trigger.task_ids)
+    scorecard = [
+        "## Evaluation scorecard",
+        "The selected failure is marked TARGET; preserve behavior on the other tasks.",
+    ]
+    for task in tasks:
+        outcome = report.per_task.get(task.task_id)
+        success = outcome.success_rate if outcome is not None else 0.0
+        fraction = outcome.mean_fraction if outcome is not None else 0.0
+        instruction = " ".join(normalize_durable_text(task.instruction).split())
+        if len(instruction) > 240:
+            instruction = f"{instruction[:237]}..."
+        marker = "TARGET" if task.task_id in selected else "other"
+        scorecard.append(
+            f"- [{marker}] {task.task_id}: success={success:.2f}, "
+            f"assertion_fraction={fraction:.2f} — {instruction}"
+        )
+    sections = [
+        "\n".join(scorecard),
+        f"## Selected failure\n\nFailure mechanism: {trigger.mechanism}",
+    ]
     for task_id in trigger.task_ids:
         task = by_id.get(task_id)
         outcome = report.per_task.get(task_id)
-        instruction = task.instruction if task is not None else "(unknown task)"
+        instruction = (
+            normalize_durable_text(task.instruction) if task is not None else "(unknown task)"
+        )
         rate = f"{outcome.success_rate:.2f} over {outcome.passes} passes" if outcome else "?"
-        sections.append(f"### Task {task_id} (success_rate={rate})\nInstruction: {instruction}")
+        fraction = f", assertion_fraction={outcome.mean_fraction:.2f}" if outcome else ""
+        task_section = [
+            f"### Task {task_id} (success_rate={rate}{fraction})",
+            f"Instruction: {instruction}",
+        ]
+        if outcome is not None:
+            for index, verdict in enumerate(outcome.verdicts, 1):
+                attempt = outcome.attempts[index - 1] if index <= len(outcome.attempts) else None
+                task_section.append(_render_attempt(index=index, attempt=attempt, verdict=verdict))
+        sections.append("\n\n".join(task_section))
     unmet = "\n".join(f"- {a}" for a in trigger.unmet_assertions)
-    sections.append(f"Unmet assertions across the cluster:\n{unmet or '- (none recorded)'}")
+    sections.append(
+        "Original trigger assertions from the parent (current attempt verdicts above are "
+        f"authoritative):\n{unmet or '- (none recorded)'}"
+    )
     return "\n\n".join(sections)
+
+
+def _render_attempt(*, index: int, attempt: RolloutEvidence | None, verdict: GoldVerdict) -> str:
+    """Render one rollout plus its judge feedback without unbounded prompt growth."""
+    # Keep this helper tolerant of old/deserialized reports that predate RolloutEvidence. The
+    # verdict fields remain useful even when no trace was retained.
+    lines = [
+        f"#### Attempt {index} (passed={str(verdict.passed).lower()}, "
+        f"assertion_fraction={verdict.fraction:.2f})"
+    ]
+    if attempt is not None:
+        lines.append(
+            f"Stop: {attempt.stop_reason.value}; turns={attempt.turns}\n"
+            f"Final answer:\n{normalize_durable_text(attempt.answer) or '(none)'}\n\n"
+            f"Execution transcript:\n"
+            f"{_bounded_trace(normalize_durable_text(attempt.transcript))}"
+        )
+    if verdict.assertions:
+        judged = "\n".join(
+            f"- {'PASS' if assertion.passed else 'FAIL'}: "
+            f"{normalize_durable_text(assertion.assertion)}"
+            f" — {normalize_durable_text(assertion.why) if assertion.why else '(no judge reason)'}"
+            for assertion in verdict.assertions
+        )
+        lines.append(f"Judge feedback:\n{judged}")
+    else:
+        rationale = normalize_durable_text(verdict.rationale) if verdict.rationale else ""
+        lines.append(f"Judge feedback: {rationale or '(no per-assertion feedback)'}")
+    return "\n\n".join(lines)
+
+
+def _bounded_trace(trace: str, limit: int = _TRACE_CHARS_PER_ATTEMPT) -> str:
+    """Keep both the setup and terminal behavior when a long run exceeds the evidence budget."""
+    if not trace:
+        return "(empty)"
+    if len(trace) <= limit:
+        return trace
+    head = limit // 2
+    tail = limit - head
+    omitted = len(trace) - limit
+    return f"{trace[:head]}\n... ({omitted} trace characters omitted) ...\n{trace[-tail:]}"
 
 
 def render_history(history: list[HarnessDelta], limit: int = 5) -> str:

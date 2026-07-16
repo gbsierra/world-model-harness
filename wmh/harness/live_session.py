@@ -23,7 +23,8 @@ New session frames (additive to the RunnerLink vocabulary; unknown types are ign
 sides, so eval episodes are unaffected):
 
   host -> runner
-    session_start {session_id, system, tools, files, turn_cap}
+    session_start {session_id, system, tools, files, turn_cap, max_output_tokens, temperature,
+                   conversation_scope}
     user_message  {msg_id, text}
     abort         {reason}
     ping          {nonce}
@@ -50,7 +51,8 @@ from pydantic import JsonValue
 
 from wmh.core.types import JsonObject
 from wmh.harness.runner_link import Channel, TokenUsage, WorkerFn, params_schema
-from wmh.harness.tools import SUBMIT, ToolSpec
+from wmh.harness.runtime import DEFAULT_MAX_OUTPUT_TOKENS
+from wmh.harness.tools import READ_SKILL, SUBMIT, ToolSpec
 from wmh.providers.base import ToolCallingProvider
 
 # The action budget a single user turn may spend before the runner is told to stop — the live
@@ -75,6 +77,7 @@ EventKind = Literal[
     "state",
     "error",
 ]
+ConversationScope = Literal["session", "turn"]
 
 
 @dataclass(frozen=True)
@@ -150,6 +153,9 @@ class LiveSession:
         worker_fn: WorkerFn | None = None,
         actions_per_turn: int = DEFAULT_ACTIONS_PER_TURN,
         turn_cap: int = DEFAULT_TURN_CAP,
+        max_output_tokens: int = DEFAULT_MAX_OUTPUT_TOKENS,
+        temperature: float = 0.7,
+        conversation_scope: ConversationScope = "session",
     ) -> None:
         self._channel = channel
         self._tools = list(tools)
@@ -158,6 +164,8 @@ class LiveSession:
         self._files = dict(files or {})
         self._system_prompt = system_prompt
         self._skill_bodies = dict(skill_bodies or {})
+        if self._skill_bodies and READ_SKILL.name not in {tool.name for tool in self._tools}:
+            self._tools.append(READ_SKILL)
         # The worker LLM is answered host-side by a fully-configured provider's
         # `complete_chat` (Bedrock or Azure — provider-agnostic per #142), or an
         # injected `worker_fn` (tests). Left unset, an `llm_request` is answered
@@ -170,11 +178,21 @@ class LiveSession:
             self._worker_fn = None
         self._actions_per_turn = actions_per_turn
         self._turn_cap = turn_cap
+        if max_output_tokens < 1:
+            raise ValueError("max_output_tokens must be >= 1")
+        if not 0.0 <= temperature <= 2.0:
+            raise ValueError("temperature must be in [0, 2]")
+        if conversation_scope not in ("session", "turn"):
+            raise ValueError("conversation_scope must be 'session' or 'turn'")
+        self._max_output_tokens = max_output_tokens
+        self._temperature = temperature
+        self._conversation_scope = conversation_scope
 
         self._inbox: queue.Queue[_Intent] = queue.Queue()
         self._session_id = uuid.uuid4().hex
         self._status: str = "starting"
         self._closed = False
+        self._failure_message: str | None = None
         self._actions_this_turn = 0
         self._aborting = False
         self._pending_ping: str | None = None
@@ -191,6 +209,11 @@ class LiveSession:
     def closed(self) -> bool:
         return self._closed
 
+    @property
+    def failure_message(self) -> str | None:
+        """Return the runner or channel error that closed this session, when one exists."""
+        return self._failure_message
+
     def start(self, hello_timeout: float = 60.0) -> None:
         """Send `session_start` and block until the runner reports its first idle state."""
         self._channel.send(
@@ -201,6 +224,9 @@ class LiveSession:
                 "tools": self._tool_specs(),
                 "files": self._files,
                 "turn_cap": self._turn_cap,
+                "max_output_tokens": self._max_output_tokens,
+                "temperature": self._temperature,
+                "conversation_scope": self._conversation_scope,
             }
         )
         # The runner sends `state:idle` once the agent is constructed and ready for the first
@@ -213,6 +239,10 @@ class LiveSession:
             if self._handle_frame(frame):
                 if self._status in ("idle", "running"):
                     return
+                if self._closed:
+                    break
+        if self._failure_message is not None:
+            raise RuntimeError(f"live session runner did not become ready: {self._failure_message}")
         raise RuntimeError("live session runner did not become ready")
 
     # -- driver-facing intents (thread-safe) -----------------------------------------------------
@@ -226,6 +256,16 @@ class LiveSession:
     def interrupt(self, reason: str = "user_interrupt") -> None:
         """Queue an interrupt: abort the current run (does not end the session)."""
         self._inbox.put(_Interrupt(reason=reason))
+
+    def flush_pending_intents(self) -> None:
+        """Send queued controls without consuming another runner frame.
+
+        The driver uses this when it must abort and retire a session immediately. Calling
+        :meth:`pump` would also read one inbound frame, which could start another synchronous
+        provider or tool operation after cancellation was already observed.
+        """
+        if not self._closed:
+            self._drain_inbox()
 
     def end(self) -> None:
         """Queue a graceful end: abort any run, then shut the runner down."""
@@ -295,7 +335,8 @@ class LiveSession:
                 self._pending_ping = None
         elif kind == "episode_error":
             note = frame.get("note")
-            self._emit("error", {"message": note if isinstance(note, str) else "runner error"})
+            self._failure_message = note if isinstance(note, str) else "runner error"
+            self._emit("error", {"message": self._failure_message})
             self._mark_closed("failed")
         elif kind == "hello":
             pass  # the pool already consumed the handshake; a duplicate is harmless
@@ -312,7 +353,9 @@ class LiveSession:
             )
             return
         try:
-            request = ChatRequest.model_validate(body if isinstance(body, dict) else {})
+            request_body = dict(body) if isinstance(body, dict) else {}
+            request_body["temperature"] = self._temperature
+            request = ChatRequest.model_validate(request_body)
             completion = self._worker_fn(request)
             self._meter(completion)
             self._emit_assistant(completion)
@@ -350,12 +393,12 @@ class LiveSession:
 
         self._emit("tool_call", {"call_id": call_id, "name": name, "arguments": args})
         known = {t.name for t in self._tools}
-        if name == "read_skill":
+        if name not in known:
+            outcome = ToolOutcome(content=f"tool {name!r} not available", is_error=True)
+        elif name == READ_SKILL.name:
             outcome = self._read_skill(args)
         elif self._actions_this_turn >= self._actions_per_turn:
             outcome = ToolOutcome(content="environment action budget exhausted", is_error=True)
-        elif name not in known:
-            outcome = ToolOutcome(content=f"tool {name!r} not available", is_error=True)
         else:
             self._actions_this_turn += 1
 
@@ -381,10 +424,11 @@ class LiveSession:
         self._respond_tool(req_id, outcome.content, is_error=outcome.is_error)
 
     def _read_skill(self, args: JsonObject) -> ToolOutcome:
-        name = args.get("name")
-        body = self._skill_bodies.get(name) if isinstance(name, str) else None
+        raw_name = args.get("name")
+        name = raw_name if isinstance(raw_name, str) else ""
+        body = self._skill_bodies.get(name)
         if body is None:
-            return ToolOutcome(content=f"skill {name!r} not found", is_error=True)
+            return ToolOutcome(content=f"no skill named {name!r}", is_error=True)
         return ToolOutcome(content=body)
 
     def _respond_tool(self, req_id: JsonValue, content: str, *, is_error: bool) -> None:
@@ -443,7 +487,8 @@ class LiveSession:
             return None
         except Exception as exc:  # noqa: BLE001 - a dead runner ends the session, not the process
             if not self._closed:
-                self._emit("error", {"message": str(exc)})
+                self._failure_message = str(exc)
+                self._emit("error", {"message": self._failure_message})
                 self._mark_closed("failed")
             return None
         if frame is None and not self._closed:
@@ -456,7 +501,8 @@ class LiveSession:
         try:
             self._channel.send(frame)
         except Exception as exc:  # noqa: BLE001 - a broken channel ends the session cleanly
-            self._emit("error", {"message": f"channel send failed: {exc}"})
+            self._failure_message = f"channel send failed: {exc}"
+            self._emit("error", {"message": self._failure_message})
             self._mark_closed("failed")
 
     def _mark_closed(self, status: str) -> None:

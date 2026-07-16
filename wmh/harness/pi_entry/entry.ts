@@ -24,7 +24,7 @@ if (!SHIM) {
 	process.exit(2);
 }
 const BASE = SHIM.replace(/\/$/, "");
-const MAX_TURNS = 20;
+const DEFAULT_MAX_TURNS = 20;
 
 interface TaskTool {
 	name: string;
@@ -35,6 +35,8 @@ interface Task {
 	instruction: string;
 	system?: string;
 	tools: TaskTool[];
+	max_turns?: number;
+	max_output_tokens?: number;
 }
 
 async function getJson<T>(path: string): Promise<T> {
@@ -116,6 +118,20 @@ function makeSubmitTool(): AgentTool<any> {
 
 async function main(): Promise<void> {
 	const task = await getJson<Task>("/task");
+	const configuredMaxTurns = task.max_turns;
+	const maxTurns =
+		configuredMaxTurns !== undefined &&
+		Number.isInteger(configuredMaxTurns) &&
+		configuredMaxTurns >= 1
+			? configuredMaxTurns
+			: DEFAULT_MAX_TURNS;
+	const configuredMaxOutputTokens = task.max_output_tokens;
+	const maxOutputTokens =
+		configuredMaxOutputTokens !== undefined &&
+		Number.isInteger(configuredMaxOutputTokens) &&
+		configuredMaxOutputTokens >= 1
+			? configuredMaxOutputTokens
+			: 4096;
 
 	const model: Model<"openai-completions"> = {
 		id: "stub-model",
@@ -127,7 +143,7 @@ async function main(): Promise<void> {
 		input: ["text"],
 		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
 		contextWindow: 128000,
-		maxTokens: 4096,
+		maxTokens: maxOutputTokens,
 	};
 
 	// `submit` is provided by entry.ts (it drives /done + loop termination); drop any
@@ -145,7 +161,7 @@ async function main(): Promise<void> {
 		getApiKey: () => "x",
 	});
 
-	// Hard turn cap: abort after MAX_TURNS assistant turns to avoid runaway loops.
+	// Hard turn cap: use the harness document's per-episode value.
 	let turnCount = 0;
 	agent.subscribe((event) => {
 		if (event.type === "turn_end" || event.type === "message_end") {
@@ -154,7 +170,7 @@ async function main(): Promise<void> {
 		}
 		if (event.type === "turn_end") {
 			turnCount += 1;
-			if (turnCount >= MAX_TURNS) agent.abort();
+			if (turnCount >= maxTurns) agent.abort();
 		}
 	});
 

@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import os
 import time
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Sequence
 from typing import Protocol, cast, runtime_checkable
 
 from pydantic import BaseModel
@@ -40,6 +40,26 @@ DEFAULT_SANDBOX_TIMEOUT_S = 900.0
 
 # Fixed delays before each retry of sandbox creation (RetryingProvider precedent: 1s, 3s, 9s).
 _CREATE_DELAYS = (1.0, 3.0, 9.0)
+# Teardown is normally one cheap request. Two short deterministic retries cover a stale HTTP/2
+# connection without adding latency to the success path or hiding a sandbox whose release cannot
+# be proved.
+_KILL_DELAYS = (0.1, 0.5)
+_KILL_REQUEST_TIMEOUT_S = 5.0
+
+
+class SandboxCleanupError(RuntimeError):
+    """An E2B sandbox may still be live after bounded teardown retries."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        resource: str = "e2b_sandbox",
+        sandbox_usage: SandboxUsage | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.resource = resource
+        self.sandbox_usage = sandbox_usage
 
 
 @runtime_checkable
@@ -70,18 +90,42 @@ class CommandHandle(Protocol):
 
 
 class SandboxCommands(Protocol):
-    """The `sandbox.commands` slice: run (foreground or background) and stdin injection."""
+    """The `sandbox.commands` slice: run/connect commands and inject stdin."""
 
     def run(
         self,
         cmd: str,
         background: bool | None = None,
         *,
+        envs: dict[str, str] | None = None,
         stdin: bool | None = None,
         timeout: float | None = None,
     ) -> CommandOutput | CommandHandle: ...
 
-    def send_stdin(self, pid: int, data: str) -> object: ...
+    def connect(
+        self,
+        pid: int,
+        *,
+        timeout: float | None = None,
+    ) -> CommandHandle: ...
+
+    def send_stdin(
+        self,
+        pid: int,
+        data: str,
+        request_timeout: float | None = None,
+    ) -> object: ...
+
+    def list(self, request_timeout: float | None = None) -> Sequence[SandboxProcess]: ...
+
+    def kill(self, pid: int, request_timeout: float | None = None) -> object: ...
+
+
+class SandboxProcess(Protocol):
+    """The running-process field used to classify a durable runner stream EOF."""
+
+    @property
+    def pid(self) -> int: ...
 
 
 class SandboxFiles(Protocol):
@@ -89,7 +133,13 @@ class SandboxFiles(Protocol):
 
     def write(self, path: str, data: str) -> object: ...
 
-    def read(self, path: str) -> str: ...
+    def read(
+        self,
+        path: str,
+        *,
+        request_timeout: float | None = None,
+        gzip: bool = False,
+    ) -> str: ...
 
 
 @runtime_checkable
@@ -104,7 +154,7 @@ class SandboxHandle(Protocol):
 
     def set_timeout(self, timeout: int) -> None: ...
 
-    def kill(self) -> object: ...
+    def kill(self, request_timeout: float | None = None) -> object: ...
 
 
 # Opens one sandbox. The default factory calls the real SDK; tests inject fakes.
@@ -162,6 +212,34 @@ def create_sandbox(factory: SandboxFactory) -> SandboxHandle:
     return factory()  # final attempt: let any error propagate
 
 
+def kill_sandbox(sandbox: SandboxHandle) -> None:
+    """Kill one sandbox with bounded retries, failing closed when release is unproven.
+
+    A successful call, a falsey SDK result, or an explicit already-gone response all mean there
+    is no live resource left to meter. Other exceptions are retried twice; exhausting that bound
+    raises :class:`SandboxCleanupError` so callers cannot report clean cancellation while the
+    sandbox may still be billable.
+    """
+    for delay in _KILL_DELAYS:
+        try:
+            sandbox.kill(request_timeout=_KILL_REQUEST_TIMEOUT_S)
+            return
+        except Exception as error:  # noqa: BLE001 - E2B SDK errors are optional/import-free here
+            if _is_already_gone_error(error):
+                return
+            time.sleep(delay)
+    try:
+        sandbox.kill(request_timeout=_KILL_REQUEST_TIMEOUT_S)
+    except Exception as error:  # noqa: BLE001 - promote the bounded cleanup failure uniformly
+        if _is_already_gone_error(error):
+            return
+        sandbox_id = getattr(sandbox, "sandbox_id", None) or getattr(sandbox, "id", None)
+        identity = f" {sandbox_id!r}" if sandbox_id is not None else ""
+        raise SandboxCleanupError(
+            f"E2B sandbox{identity} cleanup failed after {len(_KILL_DELAYS) + 1} attempts: {error}"
+        ) from error
+
+
 def _is_retryable_create_error(exc: Exception) -> bool:
     """True for capacity-shaped creation failures (rate limit / no capacity / 5xx).
 
@@ -174,3 +252,19 @@ def _is_retryable_create_error(exc: Exception) -> bool:
     if "rate limit" in text or "capacity" in text or "too many requests" in text:
         return True
     return any(code in text for code in ("429", "500", "502", "503", "504"))
+
+
+def _is_already_gone_error(exc: Exception) -> bool:
+    """Whether a failed kill explicitly proves the sandbox no longer exists."""
+    text = str(exc).lower()
+    return any(
+        marker in text
+        for marker in (
+            "sandbox not found",
+            "sandbox is not found",
+            "sandbox already killed",
+            "sandbox has been killed",
+            "sandbox already closed",
+            "sandbox has expired",
+        )
+    )

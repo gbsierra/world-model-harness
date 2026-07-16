@@ -39,7 +39,10 @@ console.warn = toStderr;
 console.debug = toStderr;
 
 const AGENT_MODEL = process.env.PI_AGENT_MODEL ?? "worker";
-const MAX_TURNS = Number(process.env.PI_MAX_TURNS ?? "20");
+const configuredMaxTurns = Number(process.env.PI_MAX_TURNS ?? "20");
+const DEFAULT_MAX_TURNS =
+	Number.isInteger(configuredMaxTurns) && configuredMaxTurns >= 1 ? configuredMaxTurns : 20;
+const TRANSPORT_KEEPALIVE_MS = 30_000;
 
 type Frame = Record<string, any>;
 
@@ -92,6 +95,16 @@ class StdioConn {
 			this.waiters.set(req_id, resolve);
 			this.send({ type, req_id, ...payload });
 		});
+	}
+
+	/** Keep the E2B command stream and its pooled sandbox lease alive during one active episode. */
+	startTransportKeepalive(): () => void {
+		const timer = setInterval(
+			() => this.send({ type: "transport_keepalive" }),
+			TRANSPORT_KEEPALIVE_MS,
+		);
+		timer.unref();
+		return () => clearInterval(timer);
 	}
 
 	private onData(chunk: string): void {
@@ -153,6 +166,7 @@ function startLlmBridge(conn: StdioConn): Promise<Bridge> {
 					const choice = reply.completion?.choices?.[0] ?? {};
 					const msg = choice.message ?? {};
 					const delta: any = { role: "assistant", content: msg.content ?? "" };
+					if (msg.reasoning_details) delta.reasoning_details = msg.reasoning_details;
 					if (msg.tool_calls) {
 						// Keep `function` explicitly nested (the streaming OpenAI shape the pi parser
 						// expects); index each call.
@@ -164,7 +178,12 @@ function startLlmBridge(conn: StdioConn): Promise<Bridge> {
 						}));
 					}
 					const first = { choices: [{ index: 0, delta, finish_reason: null }] };
-					const last = { choices: [{ index: 0, delta: {}, finish_reason: choice.finish_reason ?? "stop" }] };
+					const last = {
+						choices: [{ index: 0, delta: {}, finish_reason: choice.finish_reason ?? "stop" }],
+						// Pi uses the latest assistant usage to estimate occupied context. Without this,
+						// it falls back to chars/4 and can prematurely clamp the next output budget.
+						usage: reply.completion?.usage,
+					};
 					res.write(`data: ${JSON.stringify(first)}\n\n`);
 					res.write(`data: ${JSON.stringify(last)}\n\n`);
 					res.end("data: [DONE]\n\n");
@@ -203,10 +222,19 @@ async function loadAgent(start: Frame): Promise<[any, () => void]> {
 
 async function runEpisode(conn: StdioConn, start: Frame): Promise<void> {
 	const episodeId = start.episode_id;
+	const maxTurns =
+		Number.isInteger(start.max_turns) && start.max_turns >= 1
+			? start.max_turns
+			: DEFAULT_MAX_TURNS;
+	const maxOutputTokens =
+		Number.isInteger(start.max_output_tokens) && start.max_output_tokens >= 1
+			? start.max_output_tokens
+			: 4096;
 	let doneSent = false;
 	let lastAssistantText = "";
 	let bridge: Bridge | null = null;
 	let cleanupSrc: () => void = () => {};
+	const stopTransportKeepalive = conn.startTransportKeepalive();
 
 	try {
 		const [AgentCtor, cleanup] = await loadAgent(start);
@@ -223,7 +251,7 @@ async function runEpisode(conn: StdioConn, start: Frame): Promise<void> {
 			input: ["text"],
 			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
 			contextWindow: 128000,
-			maxTokens: 4096,
+			maxTokens: maxOutputTokens,
 		};
 
 		const envTools: any[] = (start.tools ?? [])
@@ -266,7 +294,7 @@ async function runEpisode(conn: StdioConn, start: Frame): Promise<void> {
 			}
 			if (event.type === "turn_end") {
 				turns += 1;
-				if (turns >= MAX_TURNS) agent.abort();
+				if (turns >= maxTurns) agent.abort();
 			}
 		});
 
@@ -275,6 +303,7 @@ async function runEpisode(conn: StdioConn, start: Frame): Promise<void> {
 	} catch (e) {
 		if (!doneSent) conn.send({ type: "episode_error", episode_id: episodeId, note: String(e) });
 	} finally {
+		stopTransportKeepalive();
 		bridge?.close();
 		cleanupSrc();
 	}

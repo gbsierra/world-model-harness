@@ -29,7 +29,9 @@ import { FrameConn, type Frame } from "./runner_frames.ts";
 
 const [HOST, PORT] = (process.env.PI_LINK_ADDR ?? "127.0.0.1:8900").split(":");
 const AGENT_MODEL = process.env.PI_AGENT_MODEL ?? "worker";
-const MAX_TURNS = Number(process.env.PI_MAX_TURNS ?? "20");
+const configuredMaxTurns = Number(process.env.PI_MAX_TURNS ?? "20");
+const DEFAULT_MAX_TURNS =
+	Number.isInteger(configuredMaxTurns) && configuredMaxTurns >= 1 ? configuredMaxTurns : 20;
 
 function assistantText(msg: any): string {
 	if (!msg || msg.role !== "assistant" || !Array.isArray(msg.content)) return "";
@@ -64,6 +66,7 @@ function startLlmBridge(conn: FrameConn): Promise<Bridge> {
 					const choice = reply.completion?.choices?.[0] ?? {};
 					const msg = choice.message ?? {};
 					const delta: any = { role: "assistant", content: msg.content ?? "" };
+					if (msg.reasoning_details) delta.reasoning_details = msg.reasoning_details;
 					if (msg.tool_calls) {
 						// Keep `function` explicitly nested (the streaming OpenAI shape the pi parser
 						// expects); index each call.
@@ -75,7 +78,12 @@ function startLlmBridge(conn: FrameConn): Promise<Bridge> {
 						}));
 					}
 					const first = { choices: [{ index: 0, delta, finish_reason: null }] };
-					const last = { choices: [{ index: 0, delta: {}, finish_reason: choice.finish_reason ?? "stop" }] };
+					const last = {
+						choices: [{ index: 0, delta: {}, finish_reason: choice.finish_reason ?? "stop" }],
+						// Pi uses the latest assistant usage to estimate occupied context. Without this,
+						// it falls back to chars/4 and can prematurely clamp the next output budget.
+						usage: reply.completion?.usage,
+					};
 					res.write(`data: ${JSON.stringify(first)}\n\n`);
 					res.write(`data: ${JSON.stringify(last)}\n\n`);
 					res.end("data: [DONE]\n\n");
@@ -115,6 +123,14 @@ async function runEpisode(conn: FrameConn, start: Frame): Promise<void> {
 	const bridge = await startLlmBridge(conn);
 	const [AgentCtor, cleanupSrc] = await loadAgent(start);
 	const episodeId = start.episode_id;
+	const maxTurns =
+		Number.isInteger(start.max_turns) && start.max_turns >= 1
+			? start.max_turns
+			: DEFAULT_MAX_TURNS;
+	const maxOutputTokens =
+		Number.isInteger(start.max_output_tokens) && start.max_output_tokens >= 1
+			? start.max_output_tokens
+			: 4096;
 	let doneSent = false;
 	let lastAssistantText = "";
 
@@ -128,7 +144,7 @@ async function runEpisode(conn: FrameConn, start: Frame): Promise<void> {
 		input: ["text"],
 		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
 		contextWindow: 128000,
-		maxTokens: 4096,
+		maxTokens: maxOutputTokens,
 	};
 
 	const envTools: AgentTool<any>[] = (start.tools ?? [])
@@ -173,7 +189,7 @@ async function runEpisode(conn: FrameConn, start: Frame): Promise<void> {
 		}
 		if (event.type === "turn_end") {
 			turns += 1;
-			if (turns >= MAX_TURNS) agent.abort();
+			if (turns >= maxTurns) agent.abort();
 		}
 	});
 

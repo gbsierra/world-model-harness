@@ -26,19 +26,27 @@ from __future__ import annotations
 import hashlib
 import os
 import re
+from collections.abc import Callable
 from enum import StrEnum
 from typing import TYPE_CHECKING
 
 from pydantic import BaseModel, Field, field_validator, model_validator
 
+from wmh.core.text import validate_durable_text
 from wmh.harness.code_runtime import (
     DEFAULT_RUNTIME_CODE,
     CodeRuntime,
     compile_harness_code,
 )
-from wmh.harness.runtime import DEFAULT_MAX_TURNS, DEFAULT_SYSTEM_PROMPT, AgentRuntime, Runtime
+from wmh.harness.runtime import (
+    DEFAULT_MAX_OUTPUT_TOKENS,
+    DEFAULT_MAX_TURNS,
+    DEFAULT_SYSTEM_PROMPT,
+    AgentRuntime,
+    Runtime,
+)
 from wmh.harness.skills import Skill, SkillLibrary
-from wmh.harness.tools import DEFAULT_TOOLS, render_tools, resolve_tools
+from wmh.harness.tools import DEFAULT_TOOLS, READ_SKILL, render_tools, resolve_tools
 from wmh.providers.base import Provider, ToolCallingProvider
 
 if TYPE_CHECKING:
@@ -48,10 +56,11 @@ if TYPE_CHECKING:
 
 _SLUG_RE = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
 
-# Well-known surface ids. Only TOOL_POLICY and the two params are singletons; prompt and skill
+# Well-known surface ids. The tool policy and scalar parameters are singletons; prompt and skill
 # surfaces may be added freely (an update can split `prompt:core` into finer sections).
 TOOL_POLICY_ID = "tool_policy:main"
 MAX_TURNS_ID = "param:max-turns"
+MAX_OUTPUT_TOKENS_ID = "param:max-output-tokens"
 TEMPERATURE_ID = "param:temperature"
 RUNTIME_KIND_ID = "param:runtime-kind"  # absent/"kit-python" -> in-process; "pi-node" -> PiRuntime
 CODE_RUNTIME_ID = "code:runtime"
@@ -85,6 +94,7 @@ class Surface(BaseModel):
 
     @model_validator(mode="after")
     def _validate(self) -> Surface:
+        validate_durable_text(self.content, field=f"surface {self.id!r} content")
         prefix, sep, slug = self.id.partition(":")
         if not sep or prefix != self.kind.value or not _SLUG_RE.match(slug):
             raise ValueError(
@@ -134,6 +144,7 @@ class HarnessDoc(BaseModel):
         # These validations construct the derived values; failures surface here, at the boundary.
         self.tools()
         self.max_turns()
+        self.max_output_tokens()
         self.temperature()
         for surface in self.surfaces:
             if surface.kind is SurfaceKind.SKILL:
@@ -202,6 +213,21 @@ class HarnessDoc(BaseModel):
             raise ValueError(f"{MAX_TURNS_ID} must be >= 1, got {value}")
         return value
 
+    def max_output_tokens(self) -> int:
+        """Return the per-model-call output cap carried by every pi execution mode."""
+        raw = self.surface(MAX_OUTPUT_TOKENS_ID)
+        if raw is None:
+            return DEFAULT_MAX_OUTPUT_TOKENS
+        try:
+            value = int(raw.content.strip())
+        except ValueError as exc:
+            raise ValueError(
+                f"{MAX_OUTPUT_TOKENS_ID} must be an integer, got {raw.content!r}"
+            ) from exc
+        if value < 1:
+            raise ValueError(f"{MAX_OUTPUT_TOKENS_ID} must be >= 1, got {value}")
+        return value
+
     def temperature(self) -> float:
         raw = self.surface(TEMPERATURE_ID)
         if raw is None:
@@ -234,6 +260,7 @@ class HarnessDoc(BaseModel):
         backend: str = "local",
         e2b_template: str | None = None,
         e2b_pool: E2BSandboxPool | None = None,
+        should_cancel: Callable[[], bool] | None = None,
     ) -> Runtime:
         """The configured agent runtime this document describes.
 
@@ -255,6 +282,13 @@ class HarnessDoc(BaseModel):
         if self.runtime_kind() == "pi-node":
             skills = SkillLibrary(self.skills())
             code_files = {s.path: s.content for s in self.code_files() if s.path is not None}
+            tool_names = self.tools()
+            # Progressive disclosure is runtime plumbing, not a burden on every persisted tool
+            # policy. Keep pi-node behavior aligned with AgentRuntime: a skill-bearing document
+            # always exposes read_skill, even when the authored policy lists only env tools.
+            if len(skills) and READ_SKILL.name not in tool_names:
+                tool_names.append(READ_SKILL.name)
+            tools = resolve_tools(tool_names)
             structured_provider = provider if isinstance(provider, ToolCallingProvider) else None
             if (
                 backend == "e2b" or os.environ.get("PI_TRANSPORT") == "link"
@@ -271,10 +305,15 @@ class HarnessDoc(BaseModel):
                 return E2BPiRuntime(
                     provider=structured_provider,
                     files=code_files,
-                    tools=resolve_tools(self.tools()),
-                    system_prompt=self._assembled_prompt(skills),
+                    tools=tools,
+                    system_prompt=self.assembled_prompt(skills),
+                    temperature=self.temperature(),
+                    skills=skills,
                     template=e2b_template,
                     pool=e2b_pool,
+                    max_turns=self.max_turns(),
+                    max_output_tokens=self.max_output_tokens(),
+                    should_cancel=should_cancel,
                 )
             # PI_TRANSPORT=link routes pi to the RunnerLink frame transport (a persistent runner the
             # host set via runner_link.set_active_channel) instead of the per-episode SSH shim; the
@@ -294,20 +333,27 @@ class HarnessDoc(BaseModel):
                 assert structured_provider is not None
                 return RunnerLink(
                     channel,
-                    tools=resolve_tools(self.tools()),
+                    tools=tools,
                     provider=structured_provider,
-                    system_prompt=self._assembled_prompt(skills),
+                    system_prompt=self.assembled_prompt(skills),
                     files=code_files,
+                    temperature=self.temperature(),
+                    skills=skills,
+                    max_turns=self.max_turns(),
+                    max_output_tokens=self.max_output_tokens(),
+                    should_cancel=should_cancel,
                 )
             from wmh.harness.pi_runtime import PiRuntime  # circular: pi_runtime imports doc
 
             return PiRuntime(
                 provider,
                 files=code_files,
-                tools=resolve_tools(self.tools()),
+                tools=tools,
                 temperature=self.temperature(),
                 skills=skills,
-                system_prompt=self._assembled_prompt(skills),
+                system_prompt=self.assembled_prompt(skills),
+                max_turns=self.max_turns(),
+                max_output_tokens=self.max_output_tokens(),
             )
         if backend == "e2b":
             raise ValueError(
@@ -324,7 +370,7 @@ class HarnessDoc(BaseModel):
                 tools=resolve_tools(self.tools()),
                 temperature=self.temperature(),
                 skills=skills,
-                system_prompt=self._assembled_prompt(skills),
+                system_prompt=self.assembled_prompt(skills),
             )
         return AgentRuntime(
             provider,
@@ -335,10 +381,14 @@ class HarnessDoc(BaseModel):
             skills=skills,
         )
 
-    def _assembled_prompt(self, skills: SkillLibrary) -> str:
-        """The full system prompt handed to harness code: sections + tools + skills index."""
-        prompt = f"{self.system_prompt()}\n\n## Tools\n{render_tools(resolve_tools(self.tools()))}"
-        index = skills.render_index()
+    def assembled_prompt(self, skills: SkillLibrary | None = None) -> str:
+        """Return the system prompt shared by episode and project session runtimes."""
+        resolved_skills = skills if skills is not None else SkillLibrary(self.skills())
+        tool_names = self.tools()
+        if len(resolved_skills) and READ_SKILL.name not in tool_names:
+            tool_names.append(READ_SKILL.name)
+        prompt = f"{self.system_prompt()}\n\n## Tools\n{render_tools(resolve_tools(tool_names))}"
+        index = resolved_skills.render_index()
         if index:
             prompt += f"\n\n## Your skills (read a body with read_skill)\n{index}"
         return prompt

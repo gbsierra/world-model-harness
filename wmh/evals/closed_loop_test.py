@@ -10,7 +10,7 @@ import threading
 
 import pytest
 
-from wmh.core.types import Action, ActionKind, Observation
+from wmh.core.types import Action, ActionKind, EnvState, Observation, Step
 from wmh.engine.world_model import WorldModel
 from wmh.evals.closed_loop import (
     ClosedLoopReport,
@@ -18,10 +18,11 @@ from wmh.evals.closed_loop import (
     evaluate_closed_loop,
     evaluate_with_env,
 )
-from wmh.evals.gold import GoldJudge, GoldVerdict
+from wmh.evals.gold import AssertionResult, GoldJudge, GoldVerdict
 from wmh.evals.tasks import TaskSpec
+from wmh.harness.e2b_sandbox import SandboxCleanupError
 from wmh.harness.environment import AgentEnvironment, is_env_action
-from wmh.harness.runtime import RunResult, StopReason
+from wmh.harness.runtime import RunResult, RuntimeCancelled, StopReason, TokenUsage
 from wmh.providers.base import Completion, Message, ProviderConfig, ProviderKind
 from wmh.retrieval import EmbeddingRetriever, HashingEmbedder
 
@@ -79,7 +80,12 @@ def test_closed_loop_scores_success_over_k_passes() -> None:
     report = evaluate_closed_loop(tasks, _wm(provider), provider, GoldJudge(provider), k=3)
     assert report.k == 3
     assert report.success_rate == 1.0
-    assert report.per_task["q1"].passes == 3
+    outcome = report.per_task["q1"]
+    assert outcome.passes == 3
+    assert len(outcome.attempts) == 3
+    assert all(attempt.answer == "the answer is 42" for attempt in outcome.attempts)
+    assert all(attempt.stop_reason == StopReason.SUBMITTED for attempt in outcome.attempts)
+    assert all("submit" in attempt.transcript for attempt in outcome.attempts)
 
 
 def test_closed_loop_reports_failure_when_judge_rejects() -> None:
@@ -204,6 +210,87 @@ def test_concurrent_report_matches_sequential() -> None:
         assert run(concurrency).model_dump() == sequential.model_dump()
 
 
+def test_rollout_evidence_is_bounded_without_losing_trace_tail() -> None:
+    class LongTraceRuntime:
+        def run(self, task_id: str, instruction: str, environment: AgentEnvironment) -> RunResult:
+            del environment
+            steps = [
+                Step(
+                    action=Action(
+                        kind=ActionKind.TOOL_CALL,
+                        name="bash",
+                        arguments={"command": f"step-{index}"},
+                    ),
+                    observation=Observation(content=f"obs-{index}-" + ("x" * 2_000)),
+                    state_before=EnvState(),
+                    task=instruction,
+                )
+                for index in range(30)
+            ]
+            return RunResult(
+                task_id=task_id,
+                steps=steps,
+                stop_reason=StopReason.SUBMITTED,
+                answer="pass",
+                turns=len(steps),
+            )
+
+    report = evaluate_with_env(
+        [TaskSpec(task_id="a-pass", instruction="long", gold=["g"])],
+        lambda _task: _StaticEnv(),
+        LongTraceRuntime(),
+        _AnswerJudge(),
+        k=1,
+    )
+
+    trace = report.per_task["a-pass"].attempts[0].transcript
+    assert len(trace) < 13_000
+    assert "trace characters omitted" in trace
+    assert "step-0" in trace
+    assert "step-29" in trace
+
+
+def test_rollout_and_judge_evidence_is_safe_for_utf8_project_files() -> None:
+    class InvalidTextRuntime:
+        def run(self, task_id: str, instruction: str, environment: AgentEnvironment) -> RunResult:
+            del instruction, environment
+            return RunResult(
+                task_id=task_id,
+                stop_reason=StopReason.SUBMITTED,
+                answer="before\x00after",
+                steps=[
+                    Step(
+                        action=Action(kind=ActionKind.MESSAGE, content="before\ud800after"),
+                        observation=Observation(content="before\udcffafter"),
+                    )
+                ],
+            )
+
+    report = evaluate_with_env(
+        [TaskSpec(task_id="t", instruction="i", gold=["g"])],
+        lambda _task: _StaticEnv(),
+        InvalidTextRuntime(),
+        _AnswerJudge(),
+        k=1,
+    )
+
+    replacement = "\N{REPLACEMENT CHARACTER}"
+    attempt = report.per_task["t"].attempts[0]
+    assert attempt.answer == f"before{replacement}after"
+    assert "\x00" not in attempt.transcript
+    assert not any(0xD800 <= ord(char) <= 0xDFFF for char in attempt.transcript)
+
+    assertion = AssertionResult(
+        assertion="before\x00after",
+        passed=False,
+        why="before\ud800after",
+    )
+    verdict = GoldVerdict(rationale="before\udcffafter", assertions=[assertion])
+    assert verdict.assertions[0].assertion == f"before{replacement}after"
+    assert verdict.assertions[0].why == f"before{replacement}after"
+    assert verdict.rationale == f"before{replacement}after"
+
+
 def test_concurrency_zero_overlaps_all_cells() -> None:
     """With concurrency=0 every (task, attempt) cell is in flight at once: a barrier sized to the
     full cell count releases only under true parallelism (any smaller pool would deadlock and trip
@@ -271,31 +358,114 @@ def test_rollout_exception_propagates_and_does_not_hang() -> None:
         )
 
 
-def test_rollout_exception_surfaces_while_other_cells_are_still_in_flight() -> None:
-    """Fail-fast must not drain in-flight cells: with sandbox rollouts those run for minutes.
+@pytest.mark.parametrize("concurrency", [1, 0])
+def test_cancellation_after_rollout_skips_the_judge(concurrency: int) -> None:
+    cancelled = threading.Event()
 
-    One cell blocks on an event; another raises immediately. The exception must reach the
-    caller while the blocker is STILL blocked (shutdown(wait=False)) — then the blocker is
-    released so its thread exits cleanly.
-    """
+    class CancellingRuntime:
+        def run(self, task_id: str, instruction: str, environment: AgentEnvironment) -> RunResult:
+            cancelled.set()
+            return RunResult(task_id=task_id, stop_reason=StopReason.SUBMITTED, answer="pass")
+
+    class CountingJudge(_AnswerJudge):
+        def __init__(self) -> None:
+            super().__init__()
+            self.calls = 0
+
+        def score(
+            self, instruction: str, answer: str, transcript: str, gold: list[str]
+        ) -> GoldVerdict:
+            self.calls += 1
+            return super().score(instruction, answer, transcript, gold)
+
+    judge = CountingJudge()
+    with pytest.raises(RuntimeCancelled, match="cancelled"):
+        evaluate_with_env(
+            [TaskSpec(task_id="cancel", instruction="x", gold=["g"])],
+            lambda task: _StaticEnv(),
+            CancellingRuntime(),
+            judge,
+            k=1,
+            concurrency=concurrency,
+            should_cancel=cancelled.is_set,
+        )
+
+    assert judge.calls == 0
+
+
+@pytest.mark.parametrize("concurrency", [1, 0])
+def test_budget_result_with_partial_transcript_is_still_judged(concurrency: int) -> None:
+    class BudgetRuntime:
+        def run(self, task_id: str, instruction: str, environment: AgentEnvironment) -> RunResult:
+            return RunResult(
+                task_id=task_id,
+                stop_reason=StopReason.BUDGET,
+                steps=[
+                    Step(
+                        action=Action(kind=ActionKind.TOOL_CALL, name="bash", arguments={}),
+                        observation=Observation(content="partial work"),
+                        state_before=EnvState(),
+                        task=instruction,
+                    )
+                ],
+            )
+
+    class CapturingJudge(_AnswerJudge):
+        def __init__(self) -> None:
+            super().__init__()
+            self.transcripts: list[str] = []
+
+        def score(
+            self, instruction: str, answer: str, transcript: str, gold: list[str]
+        ) -> GoldVerdict:
+            self.transcripts.append(transcript)
+            return super().score(instruction, answer, transcript, gold)
+
+    judge = CapturingJudge()
+    evaluate_with_env(
+        [TaskSpec(task_id="budget", instruction="x", gold=["g"])],
+        lambda task: _StaticEnv(),
+        BudgetRuntime(),
+        judge,
+        k=1,
+        concurrency=concurrency,
+    )
+
+    assert len(judge.transcripts) == 1
+    assert "partial work" in judge.transcripts[0]
+
+
+def test_rollout_exception_drains_other_started_cells_before_returning() -> None:
+    """A failed wave cannot terminalize while another cell still owns billable work."""
     release = threading.Event()
     blocker_started = threading.Event()
+    failure_raised = threading.Event()
+    blocker_finished = threading.Event()
+    abort_called = threading.Event()
+    done = threading.Event()
+    errors: list[BaseException] = []
 
     class HalfStuckRuntime:
         def run(self, task_id: str, instruction: str, environment: AgentEnvironment) -> RunResult:
             if task_id == "stuck":
                 blocker_started.set()
                 release.wait(timeout=30)
+                blocker_finished.set()
                 return RunResult(task_id=task_id, stop_reason=StopReason.SUBMITTED, answer="pass")
             blocker_started.wait(timeout=30)  # raise only once the slow cell is truly in flight
+            failure_raised.set()
             raise RuntimeError("sandbox died")
+
+        def abort(self) -> None:
+            abort_called.set()
 
     tasks = [
         TaskSpec(task_id="stuck", instruction="x", gold=["g"]),
         TaskSpec(task_id="boom", instruction="y", gold=["g"]),
     ]
-    try:
-        with pytest.raises(RuntimeError, match="sandbox died"):
+
+    def evaluate() -> None:
+        try:
             evaluate_with_env(
                 tasks,
                 lambda task: _StaticEnv(),
@@ -304,9 +474,187 @@ def test_rollout_exception_surfaces_while_other_cells_are_still_in_flight() -> N
                 k=1,
                 concurrency=0,
             )
-        assert not release.is_set()  # the raise did not wait for the stuck cell to drain
+        except BaseException as error:  # noqa: BLE001 - assert exact failure below
+            errors.append(error)
+        finally:
+            done.set()
+
+    worker = threading.Thread(target=evaluate)
+    worker.start()
+    try:
+        assert failure_raised.wait(timeout=5)
+        assert abort_called.wait(timeout=5)
+        assert not done.wait(timeout=0.1)
+        assert not blocker_finished.is_set()
+        release.set()
+        assert done.wait(timeout=5)
+        assert blocker_finished.is_set()
+        assert len(errors) == 1
+        assert isinstance(errors[0], RuntimeError)
+        assert str(errors[0]) == "sandbox died"
     finally:
-        release.set()  # let the worker thread exit
+        release.set()
+        worker.join(timeout=5)
+
+
+def test_external_cancellation_aborts_blocked_cells_before_joining() -> None:
+    """Caller polling can stop cells that have not reached runtime cancellation checks."""
+    started = threading.Event()
+    released = threading.Event()
+    abort_called = threading.Event()
+    cancelled = threading.Event()
+    done = threading.Event()
+    errors: list[BaseException] = []
+
+    class BlockedRuntime:
+        def run(self, task_id: str, instruction: str, environment: AgentEnvironment) -> RunResult:
+            del instruction, environment
+            started.set()
+            released.wait(timeout=30)
+            return RunResult(task_id=task_id, stop_reason=StopReason.SUBMITTED, answer="pass")
+
+        def abort(self) -> None:
+            abort_called.set()
+            released.set()
+
+    def evaluate() -> None:
+        try:
+            evaluate_with_env(
+                [TaskSpec(task_id="blocked", instruction="x", gold=["g"])],
+                lambda task: _StaticEnv(),
+                BlockedRuntime(),
+                _AnswerJudge(),
+                k=1,
+                concurrency=0,
+                should_cancel=cancelled.is_set,
+            )
+        except BaseException as error:  # noqa: BLE001 - assert exact type below
+            errors.append(error)
+        finally:
+            done.set()
+
+    worker = threading.Thread(target=evaluate)
+    worker.start()
+    try:
+        assert started.wait(timeout=5)
+        cancelled.set()
+        assert abort_called.wait(timeout=5)
+        assert done.wait(timeout=5)
+        assert len(errors) == 1
+        assert isinstance(errors[0], RuntimeCancelled)
+    finally:
+        released.set()
+        worker.join(timeout=5)
+
+
+def test_abort_cleanup_is_rechecked_after_worker_release_drain() -> None:
+    """A transient abort failure does not survive a clean post-drain retry."""
+    blocker_started = threading.Event()
+    first_abort = threading.Event()
+    abort_calls = 0
+
+    class RetryCleanRuntime:
+        def run(self, task_id: str, instruction: str, environment: AgentEnvironment) -> RunResult:
+            del instruction, environment
+            if task_id == "blocked":
+                blocker_started.set()
+                first_abort.wait(timeout=30)
+                return RunResult(
+                    task_id=task_id,
+                    stop_reason=StopReason.SUBMITTED,
+                    answer="pass",
+                )
+            blocker_started.wait(timeout=30)
+            raise RuntimeError("cell failed")
+
+        def abort(self) -> None:
+            nonlocal abort_calls
+            abort_calls += 1
+            first_abort.set()
+            if abort_calls == 1:
+                raise SandboxCleanupError("first cleanup attempt failed")
+
+    with pytest.raises(RuntimeError, match="cell failed"):
+        evaluate_with_env(
+            [
+                TaskSpec(task_id="blocked", instruction="x", gold=["g"]),
+                TaskSpec(task_id="failed", instruction="y", gold=["g"]),
+            ],
+            lambda task: _StaticEnv(),
+            RetryCleanRuntime(),
+            _AnswerJudge(),
+            k=1,
+            concurrency=0,
+        )
+    assert abort_calls == 2
+
+
+def test_rollout_cancellation_drains_already_started_cells() -> None:
+    """Cancellation waits for bounded in-flight work so its usage can finalize."""
+    blocker_started = threading.Event()
+    cancellation_raised = threading.Event()
+    release = threading.Event()
+    late_finished = threading.Event()
+    done = threading.Event()
+    errors: list[BaseException] = []
+
+    class CancellingRuntime:
+        def run(self, task_id: str, instruction: str, environment: AgentEnvironment) -> RunResult:
+            del instruction, environment
+            if task_id == "stuck":
+                blocker_started.set()
+                release.wait(timeout=30)
+                late_finished.set()
+                return RunResult(
+                    task_id=task_id,
+                    stop_reason=StopReason.SUBMITTED,
+                    answer="pass",
+                    worker_usage=TokenUsage(input_tokens=11, output_tokens=3, calls=1),
+                )
+            blocker_started.wait(timeout=30)
+            cancellation_raised.set()
+            raise RuntimeCancelled(
+                "cancelled",
+                worker_usage=TokenUsage(input_tokens=7, output_tokens=2, calls=1),
+            )
+
+    def evaluate() -> None:
+        try:
+            evaluate_with_env(
+                [
+                    TaskSpec(task_id="stuck", instruction="x", gold=["g"]),
+                    TaskSpec(task_id="cancel", instruction="y", gold=["g"]),
+                ],
+                lambda task: _StaticEnv(),
+                CancellingRuntime(),
+                _AnswerJudge(),
+                k=1,
+                concurrency=0,
+            )
+        except BaseException as error:  # noqa: BLE001 - assert exact type below
+            errors.append(error)
+        finally:
+            done.set()
+
+    worker = threading.Thread(target=evaluate)
+    worker.start()
+    try:
+        assert cancellation_raised.wait(timeout=5)
+        assert not done.wait(timeout=0.1)
+        assert not late_finished.is_set()
+        release.set()
+        assert done.wait(timeout=5)
+        assert late_finished.is_set()
+        assert len(errors) == 1
+        assert isinstance(errors[0], RuntimeCancelled)
+        usage = errors[0].worker_usage
+        assert usage is not None
+        assert usage.input_tokens == 18
+        assert usage.output_tokens == 5
+        assert usage.calls == 2
+    finally:
+        release.set()
+        worker.join(timeout=5)
 
 
 def test_evaluate_closed_loop_passes_concurrency_through() -> None:

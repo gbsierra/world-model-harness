@@ -4,7 +4,8 @@
  * Where runner_stdio.ts runs ONE fire-and-forget episode, this runner hosts ONE long-lived pi
  * Agent for an interactive multi-turn session: the host sends `session_start` once (materializing
  * the champion's code surfaces), then `user_message` / `abort` / `ping` frames over the session's
- * life, and the runner drives the same Agent across every turn on one accumulating transcript.
+ * life. Interactive sessions retain one transcript; filesystem-backed projects can instead scope
+ * conversation to each outer turn while reusing the same Agent, runner, and project filesystem.
  * The transport, the localhost LLM bridge (credentials stay host-side), and the env-tools-as-
  * `tool_request` contract are identical to runner_stdio.ts — deliberately re-mirrored rather than
  * imported, because runner_stdio boots per-episode helpers and this runner's lifecycle differs.
@@ -33,8 +34,11 @@ console.warn = toStderr;
 console.debug = toStderr;
 
 const AGENT_MODEL = process.env.PI_AGENT_MODEL ?? "worker";
+const TRANSPORT_KEEPALIVE_MS = 30_000;
+const LIVE_OUTBOX = process.env.WMH_LIVE_OUTBOX?.trim() || null;
 
 type Frame = Record<string, any>;
+type TransportEnvelope = { transport_seq: number; frame: Frame };
 
 function encodeFrame(frame: Frame): string {
 	return Buffer.from(JSON.stringify(frame), "utf8").toString("base64") + "\n";
@@ -51,6 +55,68 @@ function decodeFrame(line: string): Frame | null {
 	}
 }
 
+/**
+ * Durable, replayable copy of the semantic output stream.
+ *
+ * A frame file is published before the head watermark advances, and both writes use a temporary
+ * sibling plus rename. Readers may therefore trust every sequence through `head` without ever
+ * observing partial JSON. The decimal watermark also lets a replacement runner continue a
+ * pre-existing outbox without reusing committed sequence numbers.
+ */
+class DurableOutbox {
+	private readonly framesDir: string;
+	private readonly headPath: string;
+	private readonly tmpNamespace = `${process.pid}-${Date.now().toString(36)}-${process.hrtime.bigint().toString(36)}`;
+	private transportSeq = 0;
+	private tmpSeq = 0;
+
+	constructor(root: string) {
+		const resolvedRoot = path.resolve(root);
+		this.framesDir = path.join(resolvedRoot, "frames");
+		this.headPath = path.join(resolvedRoot, "head");
+		fs.mkdirSync(this.framesDir, { recursive: true });
+
+		if (fs.existsSync(this.headPath)) {
+			const current = fs.readFileSync(this.headPath, "utf8").trim();
+			const parsed = Number(current);
+			if (!Number.isSafeInteger(parsed) || parsed < 0) {
+				throw new Error(`invalid live outbox head at ${this.headPath}: ${JSON.stringify(current)}`);
+			}
+			this.transportSeq = parsed;
+		} else {
+			this.atomicWrite(this.headPath, "0\n");
+		}
+	}
+
+	publish(frame: Frame): TransportEnvelope {
+		const transport_seq = this.transportSeq + 1;
+		const envelope: TransportEnvelope = { transport_seq, frame };
+		const filename = `${String(transport_seq).padStart(20, "0")}.json`;
+		this.atomicWrite(path.join(this.framesDir, filename), JSON.stringify(envelope) + "\n");
+		this.atomicWrite(this.headPath, `${transport_seq}\n`);
+		this.transportSeq = transport_seq;
+		return envelope;
+	}
+
+	private atomicWrite(target: string, content: string): void {
+		const tmp = path.join(
+			path.dirname(target),
+			`.${path.basename(target)}.tmp-${this.tmpNamespace}-${++this.tmpSeq}`,
+		);
+		try {
+			fs.writeFileSync(tmp, content, { encoding: "utf8", flag: "wx" });
+			fs.renameSync(tmp, target);
+		} catch (error) {
+			try {
+				fs.unlinkSync(tmp);
+			} catch {
+				// The temp file may not have been created, or rename may already have consumed it.
+			}
+			throw error;
+		}
+	}
+}
+
 /** The stdio twin of runner_frames.FrameConn: `request` awaits a matching response by req_id;
  *  host-pushed frames (session_start, user_message, abort, ping, shutdown) fire handlers. */
 class StdioConn {
@@ -58,8 +124,12 @@ class StdioConn {
 	private waiters = new Map<number, (f: Frame) => void>();
 	private handlers = new Map<string, (f: Frame) => void>();
 	private reqSeq = 0;
+	private readonly outbox: DurableOutbox | null;
+	private lastInboundSeq = 0;
 
 	constructor() {
+		// Initialize the complete durable layout before `main` can emit its ready/hello frame.
+		this.outbox = LIVE_OUTBOX ? new DurableOutbox(LIVE_OUTBOX) : null;
 		process.stdin.setEncoding("utf8");
 		process.stdin.on("data", (chunk: string) => this.onData(chunk));
 		process.stdin.on("end", () => process.exit(0));
@@ -70,7 +140,13 @@ class StdioConn {
 	}
 
 	send(frame: Frame): void {
-		process.stdout.write(encodeFrame(frame));
+		if (!this.outbox) {
+			// Keep the original wire format byte-for-byte when durable transport is not requested.
+			process.stdout.write(encodeFrame(frame));
+			return;
+		}
+		const envelope = this.outbox.publish(frame);
+		process.stdout.write(encodeFrame(envelope));
 	}
 
 	request(type: string, payload: Frame): Promise<Frame> {
@@ -81,6 +157,18 @@ class StdioConn {
 		});
 	}
 
+	/** Keep the command stream active across the persistent session; timeout remains host-owned. */
+	startTransportKeepalive(): () => void {
+		const timer = setInterval(
+			// Liveness ticks carry no semantic state: leave them on the legacy wire and out of the
+			// replay log so they neither advance the sequence nor create unbounded tiny files.
+			() => process.stdout.write(encodeFrame({ type: "transport_keepalive" })),
+			TRANSPORT_KEEPALIVE_MS,
+		);
+		timer.unref();
+		return () => clearInterval(timer);
+	}
+
 	private onData(chunk: string): void {
 		this.buf += chunk;
 		let nl = this.buf.indexOf("\n");
@@ -88,9 +176,58 @@ class StdioConn {
 			const line = this.buf.slice(0, nl);
 			this.buf = this.buf.slice(nl + 1);
 			const frame = decodeFrame(line);
-			if (frame) this.dispatch(frame);
+			if (frame) this.dispatchInbound(frame);
 			nl = this.buf.indexOf("\n");
 		}
+	}
+
+	private dispatchInbound(value: Frame): void {
+		if (!this.outbox) {
+			this.dispatch(value);
+			return;
+		}
+
+		const inboundSeq = value.transport_in_seq;
+		const frame = value.frame;
+		if (
+			typeof inboundSeq !== "number" ||
+			!Number.isSafeInteger(inboundSeq) ||
+			inboundSeq <= 0 ||
+			!frame ||
+			typeof frame !== "object" ||
+			Array.isArray(frame)
+		) {
+			this.send({
+				type: "transport_nack",
+				transport_in_seq: inboundSeq,
+				expected_transport_in_seq: this.lastInboundSeq + 1,
+			});
+			return;
+		}
+		if (inboundSeq <= this.lastInboundSeq) {
+			// The original dispatch succeeded but its ack notification was lost. Re-publish only
+			// the acknowledgement: repeating a response, prompt, or tool result is unsafe.
+			this.send({ type: "transport_ack", transport_in_seq: inboundSeq });
+			return;
+		}
+		if (inboundSeq !== this.lastInboundSeq + 1) {
+			this.send({
+				type: "transport_nack",
+				transport_in_seq: inboundSeq,
+				expected_transport_in_seq: this.lastInboundSeq + 1,
+			});
+			return;
+		}
+
+		this.lastInboundSeq = inboundSeq;
+		if (frame.type === "shutdown") {
+			// shutdown exits synchronously, so persist acceptance before dispatching it.
+			this.send({ type: "transport_ack", transport_in_seq: inboundSeq });
+			this.dispatch(frame);
+			return;
+		}
+		this.dispatch(frame);
+		this.send({ type: "transport_ack", transport_in_seq: inboundSeq });
 	}
 
 	private dispatch(frame: Frame): void {
@@ -139,6 +276,7 @@ function startLlmBridge(conn: StdioConn): Promise<Bridge> {
 					const choice = reply.completion?.choices?.[0] ?? {};
 					const msg = choice.message ?? {};
 					const delta: any = { role: "assistant", content: msg.content ?? "" };
+					if (msg.reasoning_details) delta.reasoning_details = msg.reasoning_details;
 					if (msg.tool_calls) {
 						delta.tool_calls = msg.tool_calls.map((tc: any, i: number) => ({
 							index: i,
@@ -148,7 +286,12 @@ function startLlmBridge(conn: StdioConn): Promise<Bridge> {
 						}));
 					}
 					const first = { choices: [{ index: 0, delta, finish_reason: null }] };
-					const last = { choices: [{ index: 0, delta: {}, finish_reason: choice.finish_reason ?? "stop" }] };
+					const last = {
+						choices: [{ index: 0, delta: {}, finish_reason: choice.finish_reason ?? "stop" }],
+						// Pi uses the latest assistant usage to estimate occupied context. Without this,
+						// it falls back to chars/4 and can prematurely clamp the next output budget.
+						usage: reply.completion?.usage,
+					};
 					res.write(`data: ${JSON.stringify(first)}\n\n`);
 					res.write(`data: ${JSON.stringify(last)}\n\n`);
 					res.end("data: [DONE]\n\n");
@@ -252,6 +395,7 @@ class Session {
 	private running = false;
 	private turns = 0;
 	private turnCap = 60;
+	private conversationScope: "session" | "turn" = "session";
 	private interrupted = false;
 	private hitTurnCap = false;
 
@@ -261,6 +405,11 @@ class Session {
 
 	async start(frame: Frame): Promise<void> {
 		this.turnCap = Number(frame.turn_cap ?? 60);
+		this.conversationScope = frame.conversation_scope === "turn" ? "turn" : "session";
+		const maxOutputTokens =
+			Number.isInteger(frame.max_output_tokens) && frame.max_output_tokens >= 1
+				? frame.max_output_tokens
+				: 4096;
 		const AgentCtor = await loadAgent(frame);
 		assertInteractive(AgentCtor);
 		this.bridge = await startLlmBridge(this.conn);
@@ -275,7 +424,7 @@ class Session {
 			input: ["text"],
 			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
 			contextWindow: 128000,
-			maxTokens: 4096,
+			maxTokens: maxOutputTokens,
 		};
 
 		const tools = this.buildTools(frame.tools ?? []);
@@ -360,6 +509,13 @@ class Session {
 		this.turns = 0;
 		this.interrupted = false;
 		this.hitTurnCap = false;
+		if (this.conversationScope === "turn") {
+			// AgentProject stores durable memory in its filesystem and gives every outer task a
+			// self-contained request. Retaining all prior task transcripts duplicates that state,
+			// grows input cost without bound, and makes pi clamp maxTokens to 1 near its context cap.
+			// Reset only here, while idle: tool calls within this logical turn still share context.
+			this.agent.state.messages = [];
+		}
 		this.sendState("running");
 		try {
 			await this.agent.prompt(text);
@@ -397,6 +553,9 @@ class Session {
 
 function main(): void {
 	const conn = new StdioConn();
+	// AgentProject deliberately keeps this ordinary live session between proposal turns. Keep the
+	// output stream attached while idle too; host-side E2B timeout/idle-suspend policy is separate.
+	conn.startTransportKeepalive();
 	const session = new Session(conn);
 	conn.on("shutdown", () => process.exit(0));
 	conn.on("session_start", (start) => {

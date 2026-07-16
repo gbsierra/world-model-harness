@@ -25,14 +25,17 @@ from wmh.evals.tasks import TaskSpec
 from wmh.harness import create as create_module
 from wmh.harness.create import (
     CreateResult,
+    HarnessSearchCancelled,
     PoolEntry,
     cluster_failures,
     create_harness,
+    select_failure_cluster,
     select_parent,
 )
-from wmh.harness.delta import HarnessDelta
+from wmh.harness.delta import FailureSignature, GateRecord, HarnessDelta
 from wmh.harness.doc import HarnessDoc
 from wmh.harness.e2b_sandbox import SandboxUsage
+from wmh.harness.proposer import ProposalFailure, ProviderDeltaProposer
 from wmh.harness.runtime import Runtime
 from wmh.providers.base import Completion, Message, Provider, ProviderConfig, ProviderKind
 from wmh.retrieval import EmbeddingRetriever, HashingEmbedder
@@ -143,10 +146,12 @@ def _run(
     *,
     iterations: int = 1,
     k: int = 3,
+    proposal_batch_size: int = 1,
     holdout: list[TaskSpec] | None = None,
     on_progress: Callable[[int, str, float, bool], None] | None = None,
     on_note: Callable[[str], None] | None = None,
     on_accept: Callable[[HarnessDoc, HarnessDelta, float], None] | None = None,
+    should_cancel: Callable[[], bool] | None = None,
 ) -> CreateResult:
     return create_harness(
         "winner",
@@ -154,14 +159,16 @@ def _run(
         _tasks(),
         _wm(provider),
         provider,
-        provider,
+        ProviderDeltaProposer(provider),
         GoldJudge(provider),
         iterations=iterations,
+        proposal_batch_size=proposal_batch_size,
         k=k,
         holdout=holdout,
         on_progress=on_progress,
         on_note=on_note,
         on_accept=on_accept,
+        should_cancel=should_cancel,
     )
 
 
@@ -237,6 +244,103 @@ def test_create_skips_unusable_proposals() -> None:
         (1, "unusable"),
         (2, "unusable"),
     ]
+
+
+def test_create_stops_before_the_next_expensive_phase_when_cancelled() -> None:
+    provider = RoleProvider(meta_reply="not json at all")
+    checks = 0
+
+    def should_cancel() -> bool:
+        nonlocal checks
+        checks += 1
+        return checks >= 2
+
+    with pytest.raises(HarnessSearchCancelled):
+        _run(provider, should_cancel=should_cancel)
+
+    assert provider.meta_users == []
+
+
+def test_create_passes_cancellation_into_a_batched_provider_proposer() -> None:
+    seed = HarnessDoc.baseline("seed")
+    provider = RoleProvider(meta_reply=_meta_reply(seed, _CAREFUL_PROMPT))
+
+    with pytest.raises(HarnessSearchCancelled, match="cancelled"):
+        _run(
+            provider,
+            proposal_batch_size=3,
+            should_cancel=lambda: len(provider.meta_users) >= 1,
+        )
+
+    assert len(provider.meta_users) == 1
+
+
+def test_create_never_converts_explicit_proposer_cancellation_to_failures() -> None:
+    class _CancellingMetaProvider(RoleProvider):
+        def complete(
+            self,
+            system: str,
+            messages: list[Message],
+            *,
+            temperature: float = 0.7,
+            max_tokens: int = 2048,
+        ) -> Completion:
+            if "meta-agent improving an agent harness" in system:
+                raise HarnessSearchCancelled("harness search cancelled")
+            return super().complete(
+                system,
+                messages,
+                temperature=temperature,
+                max_tokens=max_tokens,
+            )
+
+    with pytest.raises(HarnessSearchCancelled, match="cancelled"):
+        _run(_CancellingMetaProvider())
+
+
+def test_cancellation_wins_before_accepted_lineage_and_callback_mutate(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    seed = HarnessDoc.baseline("seed")
+    provider = RoleProvider(meta_reply=_meta_reply(seed, _CAREFUL_PROMPT))
+    cancelled = False
+    crowned: list[str] = []
+    gate_delta = create_module.gate_delta
+
+    def cancelling_gate(
+        delta: HarnessDelta,
+        *,
+        child: ClosedLoopReport,
+        champion: ClosedLoopReport,
+        best_full: float,
+        suite: list[str],
+        child_holdout: ClosedLoopReport | None = None,
+        champion_holdout: ClosedLoopReport | None = None,
+    ) -> GateRecord:
+        nonlocal cancelled
+        verdict = gate_delta(
+            delta,
+            child=child,
+            champion=champion,
+            best_full=best_full,
+            suite=suite,
+            child_holdout=child_holdout,
+            champion_holdout=champion_holdout,
+        )
+        if verdict.accepted:
+            cancelled = True
+        return verdict
+
+    monkeypatch.setattr(create_module, "gate_delta", cancelling_gate)
+
+    with pytest.raises(HarnessSearchCancelled, match="cancelled"):
+        _run(
+            provider,
+            should_cancel=lambda: cancelled,
+            on_accept=lambda doc, delta, score: crowned.append(doc.doc_hash),
+        )
+
+    assert crowned == []
 
 
 def test_create_audits_invalid_delta_without_spending_eval() -> None:
@@ -327,6 +431,132 @@ def test_cluster_failures_empty_when_everything_passes() -> None:
     assert cluster_failures(report, [TaskSpec(task_id="t1", instruction="i")]) == []
 
 
+def test_select_failure_cluster_rotates_equally_sized_failures() -> None:
+    clusters = [
+        FailureSignature(mechanism=mechanism, task_ids=[f"t-{mechanism}"])
+        for mechanism in ("a", "b", "c")
+    ]
+    counts: dict[tuple[str, str, tuple[str, ...]], int] = {}
+    selected: list[str] = []
+    for _ in range(4):
+        cluster = select_failure_cluster(clusters, counts, parent_doc_hash="parent")
+        selected.append(cluster.mechanism)
+        key = ("parent", cluster.mechanism, tuple(cluster.task_ids))
+        counts[key] = counts.get(key, 0) + 1
+
+    assert selected == ["a", "b", "c", "a"]
+
+
+def test_create_rotates_failure_evidence_after_a_screened_batch() -> None:
+    seed = HarnessDoc.baseline("seed")
+    provider = RoleProvider(meta_reply=_useless_meta_reply(seed), judge_fn=lambda _user: False)
+    tasks = [
+        TaskSpec(task_id="t1", instruction="first failure", gold=["alpha assertion"]),
+        TaskSpec(task_id="t2", instruction="second failure", gold=["beta assertion"]),
+    ]
+
+    create_harness(
+        "winner",
+        seed,
+        tasks,
+        _wm(provider),
+        provider,
+        ProviderDeltaProposer(provider),
+        GoldJudge(provider),
+        iterations=2,
+        k=1,
+    )
+
+    assert "[TARGET] t1" in provider.meta_users[0]
+    assert "[other] t2" in provider.meta_users[0]
+    assert "[TARGET] t2" in provider.meta_users[1]
+    assert "[other] t1" in provider.meta_users[1]
+
+
+def test_create_does_not_discount_a_cluster_when_the_proposer_failed() -> None:
+    seed = HarnessDoc.baseline("seed")
+    provider = RoleProvider(judge_fn=lambda _user: False)
+    tasks = [
+        TaskSpec(task_id="t1", instruction="first failure", gold=["alpha assertion"]),
+        TaskSpec(task_id="t2", instruction="second failure", gold=["beta assertion"]),
+    ]
+
+    class FailingProposer:
+        def __init__(self) -> None:
+            self.triggers: list[FailureSignature] = []
+
+        def propose_batch(  # noqa: PLR0913 - mirrors the proposer protocol
+            self,
+            parent: HarnessDoc,
+            trigger: FailureSignature,
+            evidence: str,
+            *,
+            history: list[HarnessDelta],
+            count: int,
+            should_cancel: Callable[[], bool] | None = None,
+        ) -> list[HarnessDelta | ProposalFailure | None]:
+            del parent, evidence, history, should_cancel
+            self.triggers.append(trigger)
+            return [ProposalFailure(reason="temporary transport failure")] * count
+
+    proposer = FailingProposer()
+    create_harness(
+        "winner",
+        seed,
+        tasks,
+        _wm(provider),
+        provider,
+        proposer,
+        GoldJudge(provider),
+        iterations=2,
+        k=1,
+    )
+
+    assert [trigger.task_ids for trigger in proposer.triggers] == [["t1"], ["t1"]]
+
+
+def test_create_does_not_discount_a_cluster_when_every_delta_is_invalid() -> None:
+    """Parsed deltas spend no cluster allocation until one can enter evaluation."""
+    seed = HarnessDoc.baseline("seed")
+    stale = json.dumps(
+        {
+            "expected_effect": "fix the selected failure",
+            "preconditions": {"prompt:core": "0" * 32},
+            "ops": [
+                {
+                    "op": "replace",
+                    "surface_id": "prompt:core",
+                    "content": _CAREFUL_PROMPT,
+                    "rationale": "exercise the invalid-before-eval path",
+                }
+            ],
+        }
+    )
+    provider = RoleProvider(meta_reply=stale, judge_fn=lambda _user: False)
+    tasks = [
+        TaskSpec(task_id="t1", instruction="first failure", gold=["alpha assertion"]),
+        TaskSpec(task_id="t2", instruction="second failure", gold=["beta assertion"]),
+    ]
+
+    result = create_harness(
+        "winner",
+        seed,
+        tasks,
+        _wm(provider),
+        provider,
+        ProviderDeltaProposer(provider),
+        GoldJudge(provider),
+        iterations=2,
+        k=1,
+    )
+
+    assert result.skipped == 2
+    assert "[TARGET] t1" in provider.meta_users[0]
+    assert "[TARGET] t1" in provider.meta_users[1]
+    assert "[other] t2" in provider.meta_users[0]
+    assert "[other] t2" in provider.meta_users[1]
+
+
 # -- parent selection --------------------------------------------------------------------------
 
 
@@ -375,6 +605,219 @@ def test_screen_rejects_delta_that_does_not_improve_its_trigger() -> None:
     # and no child progress event ever fired.
     assert len(result.reports) == 1
     assert [e[0] for e in progress] == [0]
+
+
+def test_screen_uses_assertion_fraction_to_admit_partial_improvement() -> None:
+    seed = HarnessDoc.baseline("seed")
+
+    class PartialJudgeProvider(RoleProvider):
+        def complete(
+            self,
+            system: str,
+            messages: list[Message],
+            *,
+            temperature: float = 0.7,
+            max_tokens: int = 2048,
+        ) -> Completion:
+            if "grade whether an agent completed a task" not in system:
+                return super().complete(
+                    system,
+                    messages,
+                    temperature=temperature,
+                    max_tokens=max_tokens,
+                )
+            user = messages[-1].content
+            improved = "done-verified" in user
+            assertions = _gold_assertions(user)
+            results = [
+                {
+                    "assertion": assertion,
+                    "passed": improved and index == 0,
+                    "why": "one subgoal improved" if improved and index == 0 else "still missing",
+                }
+                for index, assertion in enumerate(assertions)
+            ]
+            return Completion(text=json.dumps({"assertions": results, "passed": False}))
+
+    provider = PartialJudgeProvider(meta_reply=_meta_reply(seed, _CAREFUL_PROMPT))
+    tasks = [
+        TaskSpec(
+            task_id="t1",
+            instruction="complete both parts",
+            gold=["part one complete", "part two complete"],
+        )
+    ]
+
+    result = create_harness(
+        "winner",
+        seed,
+        tasks,
+        _wm(provider),
+        provider,
+        ProviderDeltaProposer(provider),
+        GoldJudge(provider),
+        iterations=1,
+        k=1,
+    )
+
+    assert result.screened == 0
+    [record] = result.iteration_records
+    assert record.outcome == "scored"
+    assert record.screen_child == record.screen_parent == 0.0
+    assert record.screen_parent_fraction == 0.0
+    assert record.screen_child_fraction == 0.5
+
+
+def test_gate_rejects_target_partial_lift_when_full_split_partial_credit_regresses() -> None:
+    """Dense screening is a prefilter; the authoritative full gate protects other tasks."""
+    delta = HarnessDelta.model_construct(
+        trigger=FailureSignature(mechanism="target", task_ids=["target"])
+    )
+    champion = ClosedLoopReport(
+        success_rate=0.0,
+        mean_fraction=0.45,
+        per_task={
+            "target": TaskOutcome(task_id="target", success_rate=0.0, mean_fraction=0.0),
+            "other": TaskOutcome(task_id="other", success_rate=0.0, mean_fraction=0.9),
+        },
+    )
+    child = ClosedLoopReport(
+        success_rate=0.0,
+        mean_fraction=0.25,
+        per_task={
+            "target": TaskOutcome(task_id="target", success_rate=0.0, mean_fraction=0.5),
+            "other": TaskOutcome(task_id="other", success_rate=0.0, mean_fraction=0.0),
+        },
+    )
+
+    verdict = create_module.gate_delta(
+        delta,
+        child=child,
+        champion=champion,
+        best_full=0.0,
+        suite=[],
+    )
+
+    assert verdict.accepted is False
+    assert verdict.full_delta == 0.0
+    assert verdict.full_fraction_delta == pytest.approx(-0.2)
+    assert "full-split assertion fraction regressed" in verdict.reason
+
+
+def test_gate_accepts_binary_tie_with_nonregressing_global_partial_progress() -> None:
+    delta = HarnessDelta.model_construct(
+        trigger=FailureSignature(mechanism="target", task_ids=["target"])
+    )
+    champion = ClosedLoopReport(
+        success_rate=0.0,
+        mean_fraction=0.1,
+        per_task={
+            "target": TaskOutcome(task_id="target", success_rate=0.0, mean_fraction=0.0),
+            "other": TaskOutcome(task_id="other", success_rate=0.0, mean_fraction=0.2),
+        },
+    )
+    child = ClosedLoopReport(
+        success_rate=0.0,
+        mean_fraction=0.35,
+        per_task={
+            "target": TaskOutcome(task_id="target", success_rate=0.0, mean_fraction=0.5),
+            "other": TaskOutcome(task_id="other", success_rate=0.0, mean_fraction=0.2),
+        },
+    )
+
+    verdict = create_module.gate_delta(
+        delta,
+        child=child,
+        champion=champion,
+        best_full=0.0,
+        suite=[],
+    )
+
+    assert verdict.accepted is True
+    assert verdict.full_fraction_delta == pytest.approx(0.25)
+
+
+def test_search_records_screen_and_full_trace_feedback_for_project_proposers() -> None:
+    seed = HarnessDoc.baseline("seed")
+    provider = RoleProvider(meta_reply=_meta_reply(seed, _CAREFUL_PROMPT))
+
+    class RecordingProposer(ProviderDeltaProposer):
+        def __init__(self, wrapped: Provider) -> None:
+            super().__init__(wrapped)
+            self.evaluations: list[tuple[str, str]] = []
+
+        def record_evaluation(self, delta: HarnessDelta, *, stage: str, content: str) -> None:
+            del delta
+            self.evaluations.append((stage, content))
+
+    proposer = RecordingProposer(provider)
+    create_harness(
+        "winner",
+        seed,
+        _tasks(),
+        _wm(provider),
+        provider,
+        proposer,
+        GoldJudge(provider),
+        iterations=1,
+        k=1,
+    )
+
+    assert [stage for stage, _content in proposer.evaluations] == ["screen", "full"]
+    assert all("Execution transcript" in content for _stage, content in proposer.evaluations)
+    assert all("Judge feedback" in content for _stage, content in proposer.evaluations)
+
+
+def test_feedback_persistence_failure_does_not_abort_scored_search() -> None:
+    seed = HarnessDoc.baseline("seed")
+    provider = RoleProvider(meta_reply=_meta_reply(seed, _CAREFUL_PROMPT))
+    notes: list[str] = []
+
+    class BrokenFeedbackProposer(ProviderDeltaProposer):
+        def record_evaluation(self, delta: HarnessDelta, *, stage: str, content: str) -> None:
+            del delta, stage, content
+            raise RuntimeError("project filesystem disconnected")
+
+    result = create_harness(
+        "winner",
+        seed,
+        _tasks(),
+        _wm(provider),
+        provider,
+        BrokenFeedbackProposer(provider),
+        GoldJudge(provider),
+        iterations=1,
+        k=1,
+        on_note=notes.append,
+    )
+
+    assert result.best_score == 1.0
+    assert len(result.iteration_records) == 1
+    assert any("screen feedback could not be persisted" in note for note in notes)
+    assert any("full feedback could not be persisted" in note for note in notes)
+
+
+def test_feedback_persistence_preserves_explicit_cancellation() -> None:
+    seed = HarnessDoc.baseline("seed")
+    provider = RoleProvider(meta_reply=_meta_reply(seed, _CAREFUL_PROMPT))
+
+    class CancellingFeedbackProposer(ProviderDeltaProposer):
+        def record_evaluation(self, delta: HarnessDelta, *, stage: str, content: str) -> None:
+            del delta, stage, content
+            raise HarnessSearchCancelled("harness search cancelled")
+
+    with pytest.raises(HarnessSearchCancelled, match="cancelled"):
+        create_harness(
+            "winner",
+            seed,
+            _tasks(),
+            _wm(provider),
+            provider,
+            CancellingFeedbackProposer(provider),
+            GoldJudge(provider),
+            iterations=1,
+            k=1,
+        )
 
 
 def test_rejected_history_reaches_the_next_proposal() -> None:
@@ -427,7 +870,7 @@ def test_code_delta_passes_screen_and_gate_end_to_end() -> None:
         _tasks(),
         _wm(provider),
         provider,
-        provider,
+        ProviderDeltaProposer(provider),
         GoldJudge(provider),
         iterations=1,
         k=3,
@@ -468,7 +911,7 @@ def test_broken_code_delta_is_rejected_before_any_eval() -> None:
         _tasks(),
         _wm(provider),
         provider,
-        provider,
+        ProviderDeltaProposer(provider),
         GoldJudge(provider),
         iterations=1,
         k=2,
@@ -501,6 +944,14 @@ def test_narrow_failing_tiers_eligibility() -> None:
     # Both tiers narrowly failing -> both retried.
     both = record(full_delta=0.05, suite_delta=-0.05, holdout_delta=-0.1)
     assert narrow_failing_tiers(both, k=5, n_suite=8, n_holdout=4) == ["suite", "holdout"]
+    # Confirmation of one binary veto cannot erase a separate dense-signal veto.
+    dense_veto = record(
+        full_delta=0.05,
+        suite_delta=-0.05,
+        holdout_delta=0.0,
+        holdout_fraction_delta=-0.2,
+    )
+    assert narrow_failing_tiers(dense_veto, k=5, n_suite=8, n_holdout=4) is None
     # Accepted verdicts are never retried.
     ok = GateRecord(accepted=True, reason="r", full_delta=0.05)
     assert narrow_failing_tiers(ok, k=5, n_suite=4, n_holdout=4) is None
@@ -581,7 +1032,7 @@ def test_confirmed_suite_overturn_still_faces_the_holdout_tier() -> None:
         tasks,
         _wm(provider),
         provider,
-        provider,
+        ProviderDeltaProposer(provider),
         GoldJudge(provider),
         iterations=1,
         k=5,
@@ -641,7 +1092,8 @@ class _ScriptedPoolChannel:
     def send(self, frame: JsonObject) -> None:
         self.sent.append(frame)
 
-    def recv(self) -> JsonObject | None:
+    def recv(self, timeout: float | None = None) -> JsonObject | None:
+        del timeout
         return self._script.pop(0) if self._script else None
 
 
@@ -655,13 +1107,17 @@ class _FakePool:
         *,
         template: str | None = None,
         api_key: str | None = None,
+        metadata: dict[str, str] | None = None,
         sandbox_factory: object = None,
         hello_timeout: float = 0.0,
     ) -> None:
         self.template = template
+        self.metadata = metadata
         self.channels: list[_ScriptedPoolChannel] = []
         self.releases: list[bool] = []
+        self.retire_idle_calls = 0
         self.closes = 0
+        self.close_failures = 0
         _FakePool.instances.append(self)
 
     def usage(self) -> SandboxUsage:
@@ -675,8 +1131,16 @@ class _FakePool:
     def release(self, sandbox: object, channel: object, *, healthy: bool) -> None:
         self.releases.append(healthy)
 
+    def retire_idle(self) -> int:
+        self.retire_idle_calls += 1
+        return 0
+
     def close(self) -> None:
         self.closes += 1
+        if self.closes <= self.close_failures:
+            from wmh.harness.e2b_sandbox import SandboxCleanupError
+
+            raise SandboxCleanupError("evaluator cleanup unproven")
 
 
 @pytest.fixture
@@ -701,7 +1165,7 @@ def test_unknown_harness_backend_is_rejected() -> None:
             _tasks(),
             _wm(provider),
             provider,
-            provider,
+            ProviderDeltaProposer(provider),
             GoldJudge(provider),
             harness_backend=bogus,
         )
@@ -717,7 +1181,7 @@ def test_e2b_backend_rejects_non_pi_node_seeds() -> None:
             _tasks(),
             _wm(provider),
             provider,
-            provider,
+            ProviderDeltaProposer(provider),
             GoldJudge(provider),
             harness_backend="e2b",
         )
@@ -737,7 +1201,7 @@ def test_local_backend_rejects_parallel_pi_node_scoring() -> None:
             _tasks(),
             _wm(provider),
             provider,
-            provider,
+            ProviderDeltaProposer(provider),
             GoldJudge(provider),
             eval_concurrency=2,
         )
@@ -767,6 +1231,7 @@ def test_e2b_backend_scores_against_the_world_model_through_the_shared_pool(
         k: int,
         concurrency: int,
         runtime: Runtime | None = None,
+        should_cancel: Callable[[], bool] | None = None,
     ) -> ClosedLoopReport:
         concurrencies.append(concurrency)
         return real_evaluate(
@@ -778,6 +1243,7 @@ def test_e2b_backend_scores_against_the_world_model_through_the_shared_pool(
             k=k,
             concurrency=concurrency,
             runtime=runtime,
+            should_cancel=should_cancel,
         )
 
     monkeypatch.setattr(create_module, "evaluate_closed_loop", spying_evaluate)
@@ -788,12 +1254,13 @@ def test_e2b_backend_scores_against_the_world_model_through_the_shared_pool(
         _tasks(),
         _wm(provider),
         provider,
-        provider,
+        ProviderDeltaProposer(provider),
         GoldJudge(provider),
         iterations=0,  # the seed eval alone exercises the whole scoring path
         k=3,
         harness_backend="e2b",
         e2b_template="tmpl-1",
+        e2b_metadata={"optimizer_run_id": "run-1", "purpose": "evaluation"},
     )
 
     # The judge passed the runner's submitted answer: the eval genuinely ran end to end.
@@ -801,9 +1268,9 @@ def test_e2b_backend_scores_against_the_world_model_through_the_shared_pool(
     assert concurrencies == [0]  # e2b default: every (task, attempt) cell at once
     [pool] = fake_pool_cls.instances  # ONE shared pool for the whole search
     assert pool.template == "tmpl-1"
-    # Closed on return (finalizing the usage meter) and again by the finally — the real pool's
-    # close is idempotent, so "at least once, before usage capture" is the contract.
-    assert pool.closes >= 1
+    assert pool.metadata == {"optimizer_run_id": "run-1", "purpose": "evaluation"}
+    # One finally owns teardown and mutates the returned model with the finalized meter.
+    assert pool.closes == 1
     assert result.sandbox_usage is not None
     assert result.sandbox_usage.count == len(pool.channels)  # the fake meters per acquire
     assert len(pool.channels) == 3  # one pooled runner episode per (task, attempt) cell
@@ -820,6 +1287,7 @@ def test_e2b_pool_is_closed_exactly_once_when_the_search_raises(
     monkeypatch: pytest.MonkeyPatch, fake_pool_cls: type[_FakePool]
 ) -> None:
     provider = RoleProvider()
+    observed_usage: list[SandboxUsage] = []
 
     def exploding_evaluate(*args: object, **kwargs: object) -> ClosedLoopReport:
         raise RuntimeError("boom mid-eval")
@@ -832,12 +1300,165 @@ def test_e2b_pool_is_closed_exactly_once_when_the_search_raises(
             _tasks(),
             _wm(provider),
             provider,
-            provider,
+            ProviderDeltaProposer(provider),
             GoldJudge(provider),
             harness_backend="e2b",
+            on_sandbox_usage=observed_usage.append,
         )
     [pool] = fake_pool_cls.instances
     assert pool.closes == 1  # the try/finally tears the pool down even on failure
+    assert observed_usage == [SandboxUsage(count=0, seconds=0.0)]
+
+
+def test_e2b_cleanup_failure_replaces_cancellation_and_withholds_final_usage(
+    monkeypatch: pytest.MonkeyPatch, fake_pool_cls: type[_FakePool]
+) -> None:
+    """Cancellation cannot look clean when evaluator release remains unproven."""
+    from wmh.harness.e2b_sandbox import SandboxCleanupError
+    from wmh.harness.runtime import RuntimeCancelled
+
+    provider = RoleProvider()
+    observed_usage: list[SandboxUsage] = []
+
+    def cancelled_evaluate(*args: object, **kwargs: object) -> ClosedLoopReport:
+        del args, kwargs
+        [pool] = fake_pool_cls.instances
+        pool.close_failures = 1
+        raise RuntimeCancelled("runtime episode cancelled")
+
+    monkeypatch.setattr(create_module, "evaluate_closed_loop", cancelled_evaluate)
+
+    with pytest.raises(SandboxCleanupError, match="cleanup unproven") as raised:
+        create_harness(
+            "winner",
+            _pi_seed(),
+            _tasks(),
+            _wm(provider),
+            provider,
+            ProviderDeltaProposer(provider),
+            GoldJudge(provider),
+            harness_backend="e2b",
+            on_sandbox_usage=observed_usage.append,
+        )
+
+    assert isinstance(raised.value.__context__, HarnessSearchCancelled)
+    assert observed_usage == []
+
+
+def test_runtime_cancellation_aborts_the_wave_without_judging_and_closes_pool(
+    monkeypatch: pytest.MonkeyPatch, fake_pool_cls: type[_FakePool]
+) -> None:
+    from wmh.harness.pi_e2b import E2BPiRuntime
+    from wmh.harness.runtime import RuntimeCancelled
+
+    provider = RoleProvider()
+    callback_seen = False
+
+    def should_cancel() -> bool:
+        return False
+
+    def cancelled_evaluate(*args: object, **kwargs: object) -> ClosedLoopReport:
+        nonlocal callback_seen
+        runtime = kwargs.get("runtime")
+        assert isinstance(runtime, E2BPiRuntime)
+        callback_seen = runtime._should_cancel is should_cancel  # noqa: SLF001
+        raise RuntimeCancelled("runtime episode cancelled")
+
+    monkeypatch.setattr(create_module, "evaluate_closed_loop", cancelled_evaluate)
+
+    with pytest.raises(HarnessSearchCancelled, match="cancelled") as raised:
+        create_harness(
+            "winner",
+            _pi_seed(),
+            _tasks(),
+            _wm(provider),
+            provider,
+            ProviderDeltaProposer(provider),
+            GoldJudge(provider),
+            harness_backend="e2b",
+            should_cancel=should_cancel,
+        )
+
+    assert callback_seen
+    [pool] = fake_pool_cls.instances
+    assert pool.closes == 1
+    assert raised.value.sandbox_usage == SandboxUsage(count=0, seconds=0.0)
+
+
+def test_cancellation_carries_completed_and_partial_wave_worker_usage(
+    monkeypatch: pytest.MonkeyPatch, fake_pool_cls: type[_FakePool]
+) -> None:
+    """The public cancellation result owns all worker spend without a partial CreateResult."""
+    from wmh.harness.runtime import RuntimeCancelled, TokenUsage
+
+    seed = _pi_seed()
+    provider = RoleProvider(meta_reply=_meta_reply(seed, _CAREFUL_PROMPT))
+    evaluate_calls = 0
+
+    def cancel_second_wave(*args: object, **kwargs: object) -> ClosedLoopReport:
+        nonlocal evaluate_calls
+        del args
+        evaluate_calls += 1
+        if evaluate_calls == 1:
+            k = kwargs.get("k", 3)
+            assert isinstance(k, int)
+            return _canned_report(0.5, k=k).model_copy(
+                update={"worker_usage": TokenUsage(input_tokens=100, output_tokens=10, calls=2)}
+            )
+        raise RuntimeCancelled(
+            "runtime episode cancelled",
+            worker_usage=TokenUsage(input_tokens=7, output_tokens=2, calls=1),
+        )
+
+    monkeypatch.setattr(create_module, "evaluate_closed_loop", cancel_second_wave)
+
+    with pytest.raises(HarnessSearchCancelled, match="cancelled") as raised:
+        create_harness(
+            "winner",
+            seed,
+            _tasks(),
+            _wm(provider),
+            provider,
+            ProviderDeltaProposer(provider),
+            GoldJudge(provider),
+            iterations=1,
+            harness_backend="e2b",
+        )
+
+    assert evaluate_calls == 2
+    assert raised.value.worker_usage == TokenUsage(input_tokens=107, output_tokens=12, calls=3)
+    assert raised.value.sandbox_usage == SandboxUsage(count=0, seconds=0.0)
+    [pool] = fake_pool_cls.instances
+    assert pool.closes == 1
+
+
+def test_e2b_pool_retires_idle_runners_once_per_proposal_batch(
+    monkeypatch: pytest.MonkeyPatch, fake_pool_cls: type[_FakePool]
+) -> None:
+    """Round boundaries rotate eval streams without rotating between sibling proposals."""
+    provider = RoleProvider()
+    monkeypatch.setattr(
+        create_module,
+        "evaluate_closed_loop",
+        lambda *a, **k: _canned_report(0.5, k=k.get("k", 3)),
+    )
+
+    result = create_harness(
+        "winner",
+        _pi_seed(),
+        _tasks(),
+        _wm(provider),
+        provider,
+        ProviderDeltaProposer(provider),
+        GoldJudge(provider),
+        iterations=2,
+        proposal_batch_size=3,
+        harness_backend="e2b",
+    )
+
+    assert result.rounds == 2 and len(result.iteration_records) == 6
+    [pool] = fake_pool_cls.instances
+    assert pool.retire_idle_calls == 2  # once per batch, never between its three siblings
 
 
 def test_eval_concurrency_overrides_both_backend_defaults(
@@ -857,7 +1478,9 @@ def test_eval_concurrency_overrides_both_backend_defaults(
         k: int,
         concurrency: int,
         runtime: Runtime | None = None,
+        should_cancel: Callable[[], bool] | None = None,
     ) -> ClosedLoopReport:
+        del should_cancel
         concurrencies.append(concurrency)
         return _canned_report(1.0, k=k)
 
@@ -870,7 +1493,7 @@ def test_eval_concurrency_overrides_both_backend_defaults(
             _tasks(),
             _wm(provider),
             provider,
-            provider,
+            ProviderDeltaProposer(provider),
             GoldJudge(provider),
             iterations=0,  # score the seed only: one eval call per run
             harness_backend="local" if harness_backend == "local" else "e2b",
@@ -907,7 +1530,9 @@ def test_create_sums_worker_usage_across_score_waves(
         k: int,
         concurrency: int,
         runtime: Runtime | None = None,
+        should_cancel: Callable[[], bool] | None = None,
     ) -> ClosedLoopReport:
+        del should_cancel
         report = _canned_report(0.5, k=k)
         return report.model_copy(
             update={"worker_usage": TokenUsage(input_tokens=100, output_tokens=10, calls=2)}
@@ -921,7 +1546,7 @@ def test_create_sums_worker_usage_across_score_waves(
         _tasks(),
         _wm(provider),
         provider,
-        provider,
+        ProviderDeltaProposer(provider),
         GoldJudge(provider),
         iterations=1,
         harness_backend="e2b",
@@ -955,7 +1580,7 @@ def test_create_worker_usage_is_none_when_no_wave_reports_it(
         _tasks(),
         _wm(provider),
         provider,
-        provider,
+        ProviderDeltaProposer(provider),
         GoldJudge(provider),
         iterations=0,
         harness_backend="local",
@@ -1003,7 +1628,7 @@ def test_e2b_rejects_a_delta_that_abandons_the_pi_runtime(
         _tasks(),
         _wm(provider),
         provider,
-        provider,
+        ProviderDeltaProposer(provider),
         GoldJudge(provider),
         iterations=1,
         harness_backend="e2b",
@@ -1076,6 +1701,30 @@ class _SequencedMetaProvider(RoleProvider):
         return super().complete(system, messages, temperature=temperature, max_tokens=max_tokens)
 
 
+def test_proposal_batch_is_generated_before_siblings_are_evaluated() -> None:
+    """One round expands one parent into independently tracked sibling candidates."""
+    seed = HarnessDoc.baseline("seed")
+    provider = _SequencedMetaProvider(
+        [
+            _meta_reply(seed, _CAREFUL_PROMPT),
+            _meta_reply(seed, f"{_CAREFUL_PROMPT} Double-check the result."),
+        ]
+    )
+
+    result = _run(provider, iterations=1, proposal_batch_size=2)
+
+    assert len(provider.meta_users) == 2
+    assert [(record.round, record.proposal_index) for record in result.iteration_records] == [
+        (1, 1),
+        (1, 2),
+    ]
+    assert [record.candidate for record in result.iteration_records] == [
+        "winner-g1-p1",
+        "winner-g1-p2",
+    ]
+    assert len(result.archive.deltas) == 2
+
+
 def test_on_accept_delivers_the_new_champion_the_moment_it_is_crowned() -> None:
     """Accepted champions stream out live, so callers can persist them in real time."""
     seed = HarnessDoc.baseline("seed")
@@ -1119,6 +1768,26 @@ def test_dead_iteration_ends_early_and_the_search_moves_on() -> None:
     scored = result.iteration_records[-1]
     assert scored.accepted is True and scored.score == 1.0
     assert scored.candidate == "winner-g2"
+
+
+def test_dead_proposals_do_not_discount_the_selected_parent(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Selection freshness changes only after a valid child is constructed."""
+    observed_counts: list[dict[str, int]] = []
+
+    def capture_selection(
+        entries: list[PoolEntry], children_counts: dict[str, int], seed: int
+    ) -> PoolEntry:
+        del seed
+        observed_counts.append(dict(children_counts))
+        return entries[0]
+
+    monkeypatch.setattr(create_module, "select_parent", capture_selection)
+    result = _run(RoleProvider(meta_reply="not json"), iterations=2)
+
+    assert result.skipped == 2
+    assert observed_counts == [{}, {}]
 
 
 def test_skipped_iterations_narrate_through_on_note() -> None:

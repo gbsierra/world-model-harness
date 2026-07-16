@@ -5,8 +5,18 @@ from __future__ import annotations
 from llm_waterfall import ChatRequest, ChatResponse
 
 from wmh.core.types import Action, Observation
-from wmh.harness.doc import RUNTIME_KIND_ID, TOOL_POLICY_ID, HarnessDoc, Surface, SurfaceKind
+from wmh.harness.doc import (
+    MAX_OUTPUT_TOKENS_ID,
+    MAX_TURNS_ID,
+    RUNTIME_KIND_ID,
+    TEMPERATURE_ID,
+    TOOL_POLICY_ID,
+    HarnessDoc,
+    Surface,
+    SurfaceKind,
+)
 from wmh.harness.pi_runtime import PiRuntime, _Episode, _params_schema
+from wmh.harness.skills import Skill, SkillLibrary
 from wmh.harness.tools import SUBMIT, TOOL_REGISTRY
 
 
@@ -37,14 +47,20 @@ class _Provider:
         )
 
 
-def _episode(env: _Env, *, budget: int = 40) -> _Episode:
+def _episode(
+    env: _Env, *, budget: int = 40, skills: SkillLibrary | None = None, temperature: float = 0.7
+) -> _Episode:
     return _Episode(
         instruction="do it",
         system_prompt="sys",
         tools=[TOOL_REGISTRY["bash"], SUBMIT],
         provider=_Provider(),
         environment=env,
+        temperature=temperature,
+        skills=skills if skills is not None else SkillLibrary(),
         max_env_actions=budget,
+        max_turns=7,
+        max_output_tokens=16384,
     )
 
 
@@ -54,6 +70,8 @@ def test_task_json_shape() -> None:
 
     tj = json.loads(json.dumps(ep.task_json()))
     assert tj["instruction"] == "do it" and tj["system"] == "sys"
+    assert tj["max_turns"] == 7
+    assert tj["max_output_tokens"] == 16384
     names = {t["name"] for t in tj["tools"]}
     assert "bash" in names and "submit" in names
     schema = json.loads(json.dumps(_params_schema(TOOL_REGISTRY["bash"])))
@@ -77,6 +95,29 @@ def test_env_action_budget_is_enforced() -> None:
         ep.run_tool("bash", {"command": "true"})
     assert len(env.actions) == 2  # only the budgeted calls reached the environment
     assert "budget exhausted" in ep.steps[-1].observation.content
+
+
+def test_worker_request_uses_document_temperature() -> None:
+    request = _episode(_Env(), temperature=0.35).worker_request(
+        {"messages": [], "temperature": 1.75}
+    )
+    assert request.temperature == 0.35
+
+
+def test_read_skill_is_runtime_local_and_does_not_consume_environment_budget() -> None:
+    env = _Env()
+    skills = SkillLibrary(
+        [Skill(name="count-words", description="count words", body="wc -w <path>")]
+    )
+    ep = _episode(env, budget=0, skills=skills)
+    ep.tools.append(TOOL_REGISTRY["read_skill"])
+
+    found = ep.run_tool("read_skill", {"name": "count-words"})
+    missing = ep.run_tool("read_skill", {"name": "ghost"})
+
+    assert found == {"content": "wc -w <path>", "is_error": False}
+    assert missing == {"content": "no skill named 'ghost'", "is_error": True}
+    assert env.actions == []
 
 
 def test_doc_dispatches_pi_runtime_for_pi_node_kind() -> None:
@@ -103,6 +144,16 @@ def test_doc_dispatches_pi_runtime_for_pi_node_kind() -> None:
             Surface(id="prompt:core", kind=SurfaceKind.PROMPT, content="p"),
             Surface(id=TOOL_POLICY_ID, kind=SurfaceKind.TOOL_POLICY, content="bash\nsubmit"),
             Surface(id=RUNTIME_KIND_ID, kind=SurfaceKind.PARAM, content="pi-node"),
+            Surface(id=MAX_TURNS_ID, kind=SurfaceKind.PARAM, content="7"),
+            Surface(id=MAX_OUTPUT_TOKENS_ID, kind=SurfaceKind.PARAM, content="16384"),
+            Surface(id=TEMPERATURE_ID, kind=SurfaceKind.PARAM, content="0.35"),
+            Surface(
+                id="skill:count-words",
+                kind=SurfaceKind.SKILL,
+                content=Skill(
+                    name="count-words", description="count words", body="wc -w <path>"
+                ).to_markdown(),
+            ),
             Surface(
                 id="code:src-agent-ts",
                 kind=SurfaceKind.CODE,
@@ -117,4 +168,13 @@ def test_doc_dispatches_pi_runtime_for_pi_node_kind() -> None:
 
     from wmh.providers.base import Provider
 
-    assert isinstance(doc.runtime(cast("Provider", _P())), PiRuntime)
+    runtime = doc.runtime(cast("Provider", _P()))
+    assert isinstance(runtime, PiRuntime)
+    assert runtime._max_turns == 7  # noqa: SLF001 - document parameter reaches entry.ts
+    assert runtime._max_output_tokens == 16384  # noqa: SLF001 - same agent model contract
+    assert runtime._temperature == 0.35  # noqa: SLF001 - same worker sampling contract
+    assert {tool.name for tool in runtime._tools} >= {  # noqa: SLF001 - runtime plumbing
+        "bash",
+        "submit",
+        "read_skill",
+    }

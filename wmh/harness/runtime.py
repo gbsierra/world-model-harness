@@ -18,6 +18,7 @@ from typing import Protocol, runtime_checkable
 from pydantic import BaseModel, Field
 
 from wmh.core.types import Action, ActionKind, EnvState, Observation, Step
+from wmh.harness.e2b_sandbox import SandboxUsage
 from wmh.harness.environment import AgentEnvironment, is_env_action
 from wmh.harness.skills import SkillLibrary
 from wmh.harness.tools import (
@@ -42,6 +43,9 @@ Work in small, verifiable steps: inspect state, act, check the result, then cont
 task is done, call `submit` with your answer. Prefer composing small bash commands over guessing."""
 
 DEFAULT_MAX_TURNS = 20  # small shell tasks converge well before this; raise for longer horizons
+# Per-call output budget used by the pi runtimes. This remains separate from the turn cap: a
+# reasoning model can exhaust one response before it emits a tool call even when many turns remain.
+DEFAULT_MAX_OUTPUT_TOKENS = 4096
 
 # Per-observation cap in the judge-facing transcript. Generous rather than tight: gold evidence
 # routinely lives deep in long outputs (`cat` of a produced file, `ls -R`), and truncating it away
@@ -52,6 +56,49 @@ _NUDGE = (
     "[ERROR] that reply was not a single valid JSON tool call. Reply with EXACTLY one JSON "
     'object: {"tool": "<tool name>", "arguments": {...}}'
 )
+
+
+class HarnessSearchCancelled(RuntimeError):
+    """The caller requested that an optimizer search stop before its next costly phase.
+
+    ``worker_usage`` aggregates every completed score wave plus the partial
+    wave interrupted by cancellation. ``sandbox_usage`` is populated by
+    ``create_harness`` after its evaluator pool has been closed. Together they
+    let a caller persist already-incurred runtime spend even though
+    cancellation intentionally produces no partial search result.
+    """
+
+    def __init__(
+        self,
+        message: str = "harness search cancelled",
+        *,
+        worker_usage: TokenUsage | None = None,
+        sandbox_usage: SandboxUsage | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.worker_usage = worker_usage
+        self.sandbox_usage = sandbox_usage
+
+
+class RuntimeCancelled(RuntimeError):
+    """The caller cancelled an in-flight runtime episode.
+
+    This is deliberately distinct from a normal ``RunResult`` stop reason: evaluation must not
+    send cancelled cells to a judge, and transport owners must not retry them as infrastructure
+    failures. Runtimes that cannot interrupt an active provider call raise this immediately after
+    that bounded call returns. Self-metering runtimes attach the worker tokens
+    incurred before that boundary so an owning evaluator can aggregate them
+    while it drains sibling episodes.
+    """
+
+    def __init__(
+        self,
+        message: str = "runtime episode cancelled",
+        *,
+        worker_usage: TokenUsage | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.worker_usage = worker_usage
 
 
 @runtime_checkable

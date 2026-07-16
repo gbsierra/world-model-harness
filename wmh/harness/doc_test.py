@@ -6,6 +6,7 @@ import pytest
 from pydantic import ValidationError
 
 from wmh.harness.doc import (
+    MAX_OUTPUT_TOKENS_ID,
     MAX_TURNS_ID,
     TEMPERATURE_ID,
     TOOL_POLICY_ID,
@@ -24,6 +25,7 @@ def _skill_surface(name: str = "count-words") -> Surface:
 def test_baseline_is_valid_and_derives_defaults() -> None:
     doc = HarnessDoc.baseline("base")
     assert doc.max_turns() == 20
+    assert doc.max_output_tokens() == 4096
     assert doc.temperature() == 0.7
     assert "submit" in doc.tools()
     assert doc.system_prompt()  # non-empty
@@ -43,6 +45,14 @@ def test_budget_is_enforced_at_construction() -> None:
     Surface(id="prompt:core", kind=SurfaceKind.PROMPT, content="ok", budget=10)
     with pytest.raises(ValidationError, match="over its budget"):
         Surface(id="prompt:core", kind=SurfaceKind.PROMPT, content="x" * 11, budget=10)
+
+
+@pytest.mark.parametrize("content", ["before\x00after", "before\ud800after"])
+def test_surface_rejects_text_that_cannot_roundtrip_through_durable_storage(
+    content: str,
+) -> None:
+    with pytest.raises(ValidationError, match="NUL|surrogate"):
+        Surface(id="prompt:core", kind=SurfaceKind.PROMPT, content=content)
 
 
 def test_doc_hash_is_content_and_order_independent() -> None:
@@ -76,6 +86,12 @@ def test_invalid_derived_values_fail_at_construction() -> None:
     bad_turns = Surface(id=MAX_TURNS_ID, kind=SurfaceKind.PARAM, content="zero")
     with pytest.raises(ValidationError, match="integer"):
         HarnessDoc(name="x", surfaces=[core, bad_turns])
+    bad_output = Surface(id=MAX_OUTPUT_TOKENS_ID, kind=SurfaceKind.PARAM, content="many")
+    with pytest.raises(ValidationError, match="integer"):
+        HarnessDoc(name="x", surfaces=[core, bad_output])
+    zero_output = Surface(id=MAX_OUTPUT_TOKENS_ID, kind=SurfaceKind.PARAM, content="0")
+    with pytest.raises(ValidationError, match=">= 1"):
+        HarnessDoc(name="x", surfaces=[core, zero_output])
     bad_temp = Surface(id=TEMPERATURE_ID, kind=SurfaceKind.PARAM, content="9.5")
     with pytest.raises(ValidationError, match=r"\[0, 2\]"):
         HarnessDoc(name="x", surfaces=[core, bad_temp])
@@ -106,6 +122,9 @@ def test_runtime_reflects_document() -> None:
     skills = doc.skills()
     assert [s.name for s in skills] == ["count-words"]
     assert doc.surface_hashes()["skill:count-words"]
+    assembled = doc.assembled_prompt()
+    assert "read_skill:" in assembled
+    assert "wc -w <path>" not in assembled  # bodies remain progressive-disclosure only
 
 
 def test_json_roundtrip_preserves_identity() -> None:
@@ -160,6 +179,8 @@ def _pi_doc() -> HarnessDoc:
             Surface(id="prompt:core", kind=SurfaceKind.PROMPT, content="p"),
             Surface(id=TOOL_POLICY_ID, kind=SurfaceKind.TOOL_POLICY, content="bash\nsubmit"),
             Surface(id=RUNTIME_KIND_ID, kind=SurfaceKind.PARAM, content="pi-node"),
+            Surface(id=MAX_TURNS_ID, kind=SurfaceKind.PARAM, content="7"),
+            Surface(id=MAX_OUTPUT_TOKENS_ID, kind=SurfaceKind.PARAM, content="16384"),
             Surface(id="code:a", kind=SurfaceKind.CODE, path="src/agent.ts", content="// a"),
         ],
     )
@@ -216,6 +237,38 @@ def test_runtime_e2b_backend_dispatch(monkeypatch: pytest.MonkeyPatch) -> None:
     shared = _pi_doc().runtime(provider, backend="e2b", e2b_pool=shared_pool)
     assert isinstance(shared, E2BPiRuntime)
     assert shared._pool is shared_pool  # noqa: SLF001 - pins the pool passthrough
+    assert shared._max_turns == 7  # noqa: SLF001 - document parameter reaches the runner
+    assert shared._max_output_tokens == 16384  # noqa: SLF001 - same agent model contract
+
+
+def test_pi_e2b_runtime_inherits_temperature_and_skill_semantics(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from wmh.harness.pi_e2b import E2BPiRuntime, E2BSandboxPool
+
+    base = _pi_doc()
+    doc = HarnessDoc(
+        name="pi-with-skill",
+        surfaces=[
+            *base.surfaces,
+            Surface(id=TEMPERATURE_ID, kind=SurfaceKind.PARAM, content="0.35"),
+            _skill_surface(),
+        ],
+    )
+    monkeypatch.delenv("WMH_E2B_TEMPLATE", raising=False)
+    pool = E2BSandboxPool()
+    runtime = doc.runtime(_stub_provider(), backend="e2b", e2b_pool=pool)
+
+    assert isinstance(runtime, E2BPiRuntime)
+    assert runtime._temperature == 0.35  # noqa: SLF001 - doc parameter reaches worker boundary
+    assert runtime._skills.get("count-words") is not None  # noqa: SLF001 - body stays available
+    assert {tool.name for tool in runtime._tools} >= {  # noqa: SLF001 - implicit runtime tool
+        "bash",
+        "submit",
+        "read_skill",
+    }
+    assert "read_skill:" in runtime._system_prompt  # noqa: SLF001 - visible in pi's prompt
+    pool.close()
 
 
 def test_runtime_e2b_backend_rejects_in_process_runtime_kinds() -> None:

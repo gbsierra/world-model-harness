@@ -7,14 +7,17 @@ for the world model; `worker_fn` is injected so the worker-LLM callback needs no
 
 from __future__ import annotations
 
+import time
 from typing import Any, cast
 
 import pytest
 from llm_waterfall import ChatRequest, ChatResponse
 
 from wmh.core.types import Action, JsonObject, Observation
-from wmh.harness.runner_link import RunnerLink, read_frame, write_frame
-from wmh.harness.runtime import StopReason
+from wmh.harness import runner_link as runner_link_module
+from wmh.harness.runner_link import RunnerLink, SocketChannel, read_frame, write_frame
+from wmh.harness.runtime import RuntimeCancelled, StopReason
+from wmh.harness.skills import Skill, SkillLibrary
 from wmh.harness.tools import SUBMIT, TOOL_REGISTRY
 
 
@@ -40,7 +43,8 @@ class _FakeChannel:
     def send(self, frame: JsonObject) -> None:
         self.sent.append(frame)
 
-    def recv(self) -> JsonObject | None:
+    def recv(self, timeout: float | None = None) -> JsonObject | None:
+        del timeout
         return self._script.pop(0) if self._script else None
 
 
@@ -51,6 +55,29 @@ class _ResponseSendTimeoutChannel(_FakeChannel):
         self.sent.append(frame)
         if frame.get("type") == "llm_response":
             raise TimeoutError("transport send timed out")
+
+
+class _EpisodeStartTimeoutChannel(_FakeChannel):
+    def send(self, frame: JsonObject) -> None:
+        self.sent.append(frame)
+        raise TimeoutError("episode start send timed out")
+
+
+class _TimedWaitChannel(_FakeChannel):
+    """Play a prefix, then model a timed wait with no runner frame."""
+
+    def __init__(self, script: list) -> None:
+        super().__init__(script)
+        self.recv_timeouts: list[float | None] = []
+
+    def recv(self, timeout: float | None = None) -> JsonObject | None:
+        self.recv_timeouts.append(timeout)
+        if self._script:
+            return self._script.pop(0)
+        if timeout is not None:
+            time.sleep(timeout)
+            raise TimeoutError("no frame before poll deadline")
+        return None
 
 
 def _tools() -> list:
@@ -102,6 +129,29 @@ class _PipeSock:
         return chunk
 
 
+class _TimedPipeSock(_PipeSock):
+    """Timeout after a partial frame, then resume from the remaining bytes."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._recv_calls = 0
+        self._timeout: float | None = None
+
+    def gettimeout(self) -> float | None:
+        return self._timeout
+
+    def settimeout(self, timeout: float | None) -> None:
+        self._timeout = timeout
+
+    def recv(self, n: int) -> bytes:
+        self._recv_calls += 1
+        if self._recv_calls == 1:
+            return super().recv(min(2, n))  # half the length header
+        if self._recv_calls == 2:
+            raise TimeoutError("fragment stalled")
+        return super().recv(n)
+
+
 def test_frame_codec_roundtrip_and_eof() -> None:
     sock = _PipeSock()
     hello: JsonObject = {"type": "hello", "n": 1, "s": "x" * 5000}
@@ -113,17 +163,40 @@ def test_frame_codec_roundtrip_and_eof() -> None:
     assert read_frame(sock) is None  # clean EOF
 
 
+def test_socket_channel_preserves_a_partial_frame_across_timed_polls() -> None:
+    sock = _TimedPipeSock()
+    frame: JsonObject = {"type": "done", "answer": "fragmented"}
+    write_frame(sock, frame)
+    channel = SocketChannel(sock)
+
+    with pytest.raises(TimeoutError, match="fragment stalled"):
+        channel.recv(timeout=0.01)
+
+    assert channel.recv(timeout=0.01) == frame
+    assert sock.gettimeout() is None  # each bounded poll restores the caller's socket setting
+
+
 # --- episode broker ---
-def test_episode_start_carries_task_and_tools() -> None:
+def test_episode_start_carries_task_tools_and_limits() -> None:
     ch = _FakeChannel([{"type": "done", "answer": "x"}])
-    _link(ch, system_prompt="sys", files={"src/agent.ts": "// a"}).run(
-        "t1", "do it", _Env(), tools=_tools()
-    )
+    _link(
+        ch,
+        system_prompt="sys",
+        files={"src/agent.ts": "// a"},
+        max_turns=7,
+        max_output_tokens=16384,
+        temperature=0.25,
+        episode_timeout_s=12.5,
+    ).run("t1", "do it", _Env(), tools=_tools())
     start = _sent(ch, "episode_start")
     assert len(start) == 1
     s = start[0]
     assert s["instruction"] == "do it" and s["system"] == "sys"
     assert s["files"] == {"src/agent.ts": "// a"}
+    assert s["max_turns"] == 7
+    assert s["max_output_tokens"] == 16384
+    assert s["temperature"] == 0.25
+    assert s["episode_timeout_s"] == 12.5
     assert {t["name"] for t in s["tools"]} >= {"bash", "submit"}
 
 
@@ -177,6 +250,65 @@ def test_llm_request_answered_via_worker_fn() -> None:
     assert resp["completion"]["choices"][0]["message"]["content"] == "hi"
 
 
+def test_harness_temperature_overrides_the_runner_request_before_the_worker_call() -> None:
+    calls: list[ChatRequest] = []
+
+    def worker(request: ChatRequest) -> ChatResponse:
+        calls.append(request)
+        return _completion()
+
+    ch = _FakeChannel(
+        [
+            {
+                "type": "llm_request",
+                "req_id": 1,
+                "openai_body": {"messages": [], "temperature": 1.75},
+            },
+            {"type": "done", "answer": "ok"},
+        ]
+    )
+    RunnerLink(ch, worker_fn=worker, temperature=0.35).run("t1", "x", _Env(), tools=_tools())
+
+    assert [request.temperature for request in calls] == [0.35]
+
+
+def test_skill_library_implicitly_adds_and_serves_read_skill_without_env_budget() -> None:
+    skill = Skill(name="count-words", description="count words", body="wc -w <path>")
+    script = [
+        {
+            "type": "tool_request",
+            "req_id": 1,
+            "name": "read_skill",
+            "arguments": {"name": "count-words"},
+        },
+        {
+            "type": "tool_request",
+            "req_id": 2,
+            "name": "read_skill",
+            "arguments": {"name": "ghost"},
+        },
+        {"type": "done", "answer": "ok"},
+    ]
+    channel = _FakeChannel(script)
+    env = _Env()
+    result = RunnerLink(
+        channel,
+        tools=_tools(),
+        worker_fn=lambda request: _completion(),
+        skills=SkillLibrary([skill]),
+        max_env_actions=0,
+    ).run("t1", "x", env)
+
+    advertised = {tool["name"] for tool in _sent(channel, "episode_start")[0]["tools"]}
+    assert "read_skill" in advertised
+    responses = _sent(channel, "tool_response")
+    assert responses[0]["content"] == "wc -w <path>" and responses[0]["is_error"] is False
+    assert responses[1]["content"] == "no skill named 'ghost'"
+    assert responses[1]["is_error"] is True
+    assert [step.action.name for step in result.steps] == ["read_skill", "read_skill"]
+    assert env.actions == []
+
+
 def test_worker_fn_error_is_reported_not_crashed() -> None:
     def boom(request: ChatRequest) -> ChatResponse:
         del request
@@ -209,6 +341,91 @@ def test_llm_response_send_timeout_propagates_without_error_response_retry() -> 
     assert "error" not in responses[0]
 
 
+def test_send_failure_after_wall_deadline_returns_budget_instead_of_transport_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ticks = iter([0.0, 2.0])  # deadline starts at 1; the failed start send returns after it
+    monkeypatch.setattr(runner_link_module.time, "monotonic", lambda: next(ticks))
+    ch = _EpisodeStartTimeoutChannel([])
+
+    result = _link(ch, episode_timeout_s=1.0).run("t1", "x", _Env(), tools=_tools())
+
+    assert result.stop_reason is StopReason.BUDGET
+    assert "wall budget" in result.transcript()
+    assert len(_sent(ch, "episode_start")) == 1
+
+
+def test_cancellation_during_worker_call_suppresses_the_llm_response() -> None:
+    cancelled = False
+
+    def worker(request: ChatRequest) -> ChatResponse:
+        nonlocal cancelled
+        del request
+        cancelled = True
+        return _completion(input_tokens=17, output_tokens=5)
+
+    ch = _FakeChannel([{"type": "llm_request", "req_id": 1, "openai_body": {}}])
+    with pytest.raises(RuntimeCancelled, match="cancelled") as raised:
+        RunnerLink(ch, worker_fn=worker, should_cancel=lambda: cancelled).run(
+            "t1", "x", _Env(), tools=_tools()
+        )
+
+    assert _sent(ch, "llm_response") == []
+    assert raised.value.worker_usage is not None
+    assert raised.value.worker_usage.input_tokens == 17
+    assert raised.value.worker_usage.output_tokens == 5
+    assert raised.value.worker_usage.calls == 1
+
+
+def test_wall_deadline_during_worker_call_suppresses_the_llm_response(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ticks = iter([0.0, 0.0, 0.0, 0.0, 2.0])
+    monkeypatch.setattr(runner_link_module.time, "monotonic", lambda: next(ticks))
+    ch = _FakeChannel([{"type": "llm_request", "req_id": 1, "openai_body": {}}])
+
+    result = RunnerLink(
+        ch,
+        worker_fn=lambda request: _completion(input_tokens=5),
+        episode_timeout_s=1.0,
+    ).run("t1", "x", _Env(), tools=_tools())
+
+    assert result.stop_reason is StopReason.BUDGET
+    assert result.worker_usage is not None and result.worker_usage.calls == 1
+    assert _sent(ch, "llm_response") == []
+
+
+def test_cancellation_during_environment_call_suppresses_the_tool_response() -> None:
+    cancelled = False
+
+    class CancellingEnv(_Env):
+        def execute(self, action: Action) -> Observation:
+            nonlocal cancelled
+            observation = super().execute(action)
+            cancelled = True
+            return observation
+
+    ch = _FakeChannel([{"type": "tool_request", "req_id": 1, "name": "bash", "arguments": {}}])
+    with pytest.raises(RuntimeCancelled, match="cancelled"):
+        _link(ch, should_cancel=lambda: cancelled).run("t1", "x", CancellingEnv(), tools=_tools())
+
+    assert _sent(ch, "tool_response") == []
+
+
+def test_wall_deadline_during_environment_call_suppresses_the_tool_response(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ticks = iter([0.0, 0.0, 0.0, 0.0, 2.0])
+    monkeypatch.setattr(runner_link_module.time, "monotonic", lambda: next(ticks))
+    ch = _FakeChannel([{"type": "tool_request", "req_id": 1, "name": "bash", "arguments": {}}])
+
+    result = _link(ch, episode_timeout_s=1.0).run("t1", "x", _Env(), tools=_tools())
+
+    assert result.stop_reason is StopReason.BUDGET
+    assert "ran bash" in result.transcript()
+    assert _sent(ch, "tool_response") == []
+
+
 def test_channel_close_without_done_reports_error() -> None:
     ch = _FakeChannel(
         [{"type": "tool_request", "req_id": 1, "name": "bash", "arguments": {}}]  # then EOF
@@ -216,6 +433,51 @@ def test_channel_close_without_done_reports_error() -> None:
     result = _link(ch).run("t1", "x", _Env(), tools=_tools())
     assert result.stop_reason is StopReason.MAX_TURNS  # a step ran, so not a bare ERROR
     assert result.steps[-1].observation.is_error
+
+
+def test_episode_wall_budget_returns_partial_usage_and_budget_stop() -> None:
+    ch = _TimedWaitChannel(
+        [
+            {"type": "llm_request", "req_id": 1, "openai_body": {}},
+            {"type": "tool_request", "req_id": 2, "name": "bash", "arguments": {}},
+        ]
+    )
+    env = _Env()
+    result = RunnerLink(
+        ch,
+        worker_fn=lambda request: _completion("working", input_tokens=11, output_tokens=3),
+        episode_timeout_s=0.01,
+    ).run("t1", "x", env, tools=_tools())
+
+    assert result.stop_reason is StopReason.BUDGET
+    assert result.worker_usage is not None
+    assert result.worker_usage.calls == 1
+    assert result.worker_usage.input_tokens == 11
+    assert [action.name for action in env.actions] == ["bash"]
+    assert "ran bash" in result.transcript()
+    assert "wall budget" in result.transcript()
+    assert ch.recv_timeouts[-1] is not None
+
+
+def test_cooperative_cancellation_interrupts_a_timed_runner_wait() -> None:
+    checks = 0
+
+    def should_cancel() -> bool:
+        nonlocal checks
+        checks += 1
+        return checks >= 4
+
+    ch = _TimedWaitChannel([])
+    with pytest.raises(RuntimeCancelled, match="cancelled"):
+        RunnerLink(
+            ch,
+            worker_fn=lambda request: _completion(),
+            episode_timeout_s=60,
+            should_cancel=should_cancel,
+            cancel_poll_interval_s=0.01,
+        ).run("t1", "x", _Env(), tools=_tools())
+
+    assert ch.recv_timeouts == [0.01]
 
 
 def test_episode_error_frame_reports_error() -> None:
@@ -260,7 +522,15 @@ def test_multiple_episodes_over_one_channel() -> None:
 def test_doc_runtime_dispatches_runner_link_under_pi_transport_link() -> None:
     import os as _os
 
-    from wmh.harness.doc import RUNTIME_KIND_ID, TOOL_POLICY_ID, HarnessDoc, Surface, SurfaceKind
+    from wmh.harness.doc import (
+        MAX_OUTPUT_TOKENS_ID,
+        MAX_TURNS_ID,
+        RUNTIME_KIND_ID,
+        TOOL_POLICY_ID,
+        HarnessDoc,
+        Surface,
+        SurfaceKind,
+    )
     from wmh.harness.runner_link import RunnerLink, set_active_channel
     from wmh.providers.base import Provider, ProviderConfig, ProviderKind
 
@@ -285,6 +555,8 @@ def test_doc_runtime_dispatches_runner_link_under_pi_transport_link() -> None:
             Surface(id="prompt:core", kind=SurfaceKind.PROMPT, content="p"),
             Surface(id=TOOL_POLICY_ID, kind=SurfaceKind.TOOL_POLICY, content="bash\nsubmit"),
             Surface(id=RUNTIME_KIND_ID, kind=SurfaceKind.PARAM, content="pi-node"),
+            Surface(id=MAX_TURNS_ID, kind=SurfaceKind.PARAM, content="7"),
+            Surface(id=MAX_OUTPUT_TOKENS_ID, kind=SurfaceKind.PARAM, content="16384"),
             Surface(id="code:a", kind=SurfaceKind.CODE, path="src/agent.ts", content="// a"),
         ],
     )
@@ -299,7 +571,10 @@ def test_doc_runtime_dispatches_runner_link_under_pi_transport_link() -> None:
         except RuntimeError as exc:
             assert "no active runner channel" in str(exc)
         set_active_channel(_FakeChannel([]))
-        assert isinstance(doc.runtime(provider), RunnerLink)
+        runtime = doc.runtime(provider)
+        assert isinstance(runtime, RunnerLink)
+        assert runtime._max_turns == 7  # noqa: SLF001 - document parameter reaches the link frame
+        assert runtime._max_output_tokens == 16384  # noqa: SLF001 - same agent model contract
     finally:
         set_active_channel(None)
         if prev is None:
