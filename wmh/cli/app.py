@@ -323,8 +323,10 @@ def build(
     region: str = typer.Option(None, help="AWS region (Bedrock)."),
     fidelity: str = typer.Option(
         "medium",
-        help="Build effort: low (RAG only) | medium (+light GEPA + cheap-lever search) | "
-        "high (+GEPA + config search) | max (deep GEPA + full config search).",
+        help="Build effort (all searching tiers are floored at low's estimate — more effort "
+        "never ships worse than low): low (free; the estimated-best config, no search) | "
+        "medium (+light GEPA + cheap-lever search) | high (+GEPA + config search) | max (deep "
+        "GEPA + full config search). The chosen config serves under `--max-fidelity`.",
     ),
     chain: str = typer.Option(
         None, "--chain", help="Named failover chain from .wmh/fallback.toml (default: its default)."
@@ -350,6 +352,12 @@ def build(
     grounder: str = typer.Option(
         "none",
         help="Web grounding for unknown entities: none | brave (needs BRAVE_SEARCH_API_KEY).",
+    ),
+    drop_degenerate: bool = typer.Option(
+        False,
+        "--drop-degenerate",
+        help="Drop all-empty-observation traces (failed captures) before building "
+        "(swe-bench is ~66% such junk).",
     ),
     interactive: bool = typer.Option(
         None,
@@ -517,6 +525,8 @@ def build(
             fidelity_budget=spec.search_budget,
             full_search=spec.full_ladder,
             cheap_search=spec.cheap_frontier_only,
+            estimate_only=spec.estimate_only,
+            drop_degenerate=drop_degenerate,
             gepa_val_cap=spec.gepa_val_cap or None,
         )
     record = tracker.record_summary()
@@ -551,11 +561,17 @@ def build(
     auto_report = Path(model_dir) / "auto_fidelity.json"
     if auto_report.exists():
         auto = json.loads(auto_report.read_text(encoding="utf-8"))
-        scores = ", ".join(f"{k}={v:.3f}" for k, v in auto["scores"].items())
+        # The low tier writes an estimate with no scores (no search ran); higher tiers write
+        # the searched scores. Render each honestly rather than an empty "(; 0 traces)".
+        if auto.get("scores"):
+            scores = ", ".join(f"{k}={v:.3f}" for k, v in auto["scores"].items())
+            provenance = f"searched: {scores}; {auto['val_traces']} held-out traces"
+        else:
+            provenance = "signature estimate — no search"
         _console.print(
             f"[bold]max-fidelity config[/bold]: [bold]{auto['winner_label']}[/bold] "
-            f"({scores}; {auto['val_traces']} held-out traces) — activate with "
-            f"`wmh serve --max-fidelity` / `wmh play --max-fidelity`"
+            f"({provenance}) — activate with `wmh serve --max-fidelity` / "
+            f"`wmh play --max-fidelity`"
         )
     _console.print(
         f"[bold]run[/bold] {record.run_id[:8]}: {record.duration_seconds:.1f}s, "
@@ -639,7 +655,12 @@ def download(
     """
     selected = list(benchmarks or [])
     if selected == ["all"]:
-        selected = sorted(CORPORA)
+        # Prefer the Hub's live list: the static registry can name corpora that aren't
+        # published yet (a 404 mid-loop used to abort the remaining downloads).
+        try:
+            selected = sorted(corpus.benchmark for corpus in published_corpora())
+        except urllib.error.URLError:
+            selected = sorted(CORPORA)
     if not selected:
         try:
             published = published_corpora()
@@ -664,6 +685,7 @@ def download(
             _console, "Download which data bundle?", [*choices, "all"], notes=notes
         )
         selected = choices if picked == "all" else [picked]
+    failures: list[str] = []
     for name in selected:
         existing = corpus_path(name).exists()
         try:
@@ -671,10 +693,11 @@ def download(
         except ValueError as exc:
             raise typer.BadParameter(str(exc)) from exc
         except urllib.error.HTTPError as exc:
-            raise typer.BadParameter(
-                f"{name}: the Hub answered {exc.code} for {exc.url}; the dataset may not be "
-                "published yet — `wmh download` with no arguments lists what is"
-            ) from exc
+            # One unpublished/broken dataset must not abort the REST of a multi-download:
+            # record it, keep fetching, and fail (with every name) at the end.
+            failures.append(f"{name}: the Hub answered {exc.code} for {exc.url}")
+            _console.print(f"[yellow]skipping {name}: Hub answered {exc.code}[/yellow]")
+            continue
         except urllib.error.URLError as exc:
             raise typer.BadParameter(
                 f"{name}: could not reach the Hub ({exc.reason}); check the connection and re-run"
@@ -682,6 +705,11 @@ def download(
             ) from exc
         state = "kept local" if existing and not force else "fetched"
         _console.print(f"{_CHECK} {state} [bold]{name}[/bold] -> {path}")
+    if failures:
+        raise typer.BadParameter(
+            "some datasets could not be downloaded (unpublished? `wmh download` with no "
+            "arguments lists what is):\n  " + "\n  ".join(failures)
+        )
 
 
 def _fetch_with_progress(name: str, *, force: bool) -> Path:

@@ -232,10 +232,21 @@ packaging is `wmh build --fidelity low|medium|high|max` + runtime `--max-fidelit
 
 | tier | prompt | retrieval phi | config search |
 |---|---|---|---|
-| low | base (no GEPA) | hashing (offline) | - |
-| medium | GEPA, 4 iterations | hashing | cheap frontier only, 4 val traces |
-| high | GEPA, 4 iterations | hashing | signature-pruned full menu, 4 val traces |
-| max | GEPA, 16 iterations | hashing | full ladder, 12 val traces |
+| low | base (no GEPA) | hashing (offline) | none — ships the signature estimate (the floor) |
+| medium | GEPA, 4 iterations | hashing | cheap frontier, 4 val traces, floored at the estimate |
+| high | GEPA, 4 iterations | hashing | signature-pruned full menu, 8 val traces, floored at the estimate |
+| max | GEPA, 16 iterations | hashing | full ladder, 16 val traces, floored at the estimate |
+
+`low` is not plain RAG: `signature_estimate` reads the zero-token `CorpusSignature` and returns
+the matrix's estimated-best config for the corpus shape (tool-call → reason, curl-heavy →
+reason+fetch, content-heavy bash → reason+kb, else reason) with no LLM calls. Every searching
+tier seeds that same deterministic estimate as an **incumbent floor** and only replaces it when
+a challenger clears the selection-noise band (`_NOISE_MARGIN`, 0.01). The guarantee this buys is
+**"no searching tier ships worse than the low estimate"** — precisely `tier ≥ low`, *not*
+`high ≥ medium` (medium and high search different menus on different sample sizes, so adjacent
+tiers are not strictly ordered; strict rung-over-rung monotonicity would need each tier's
+incumbent seeded from the previous tier's winner, which the ladder does not do). The chosen
+config serves under `--max-fidelity`; a plain `wmh serve` stays pure RAG.
 
 An evidence audit removed two ingredients that failed "each ingredient must improve, not just
 cost more": semantic embeddings at high/max (layer 2's negative result, confirmed by a
@@ -250,11 +261,19 @@ ladder (judged on a single Opus 4.7 judge; the gradient, not the absolutes, is t
 | high | 0.886 (reason) | 0.895 (reason+fetch) | 0.779 (reason+verify) |
 | max | 0.882 (reason+verify) | **0.897** (reason+fetch) | **0.781** (reason+verify) |
 
-Three tier behaviors, all as designed: terminal is monotone (+0.057 low→max), tau saturates at
-medium (the unknowable-record ceiling; more spend confirms, doesn't improve), swe steps up when
-the search finds verify. The config search rediscovered every hand-measured winner from 4-12
-selection traces, pruned by a zero-token `CorpusSignature` (curl-GET share, mean observation
-length, tool-call share).
+These absolutes predate the incumbent floor and are why it was added: the ladder ran an
+independent search per tier, so tau's **high 0.886 < medium 0.891** was a config crowned on
+selection noise that lost on the test slice. Under the floor every searching tier is anchored to
+the low estimate instead, so a tier can no longer ship below it (the residual high-vs-medium
+wobble is expected, not a regression — see the guarantee above). The config search rediscovered
+every hand-measured winner from a few selection traces, pruned by a zero-token `CorpusSignature`
+(curl-GET share, mean observation length, tool-call share).
+
+Applying this to the shipped example models (rebuilt at `high`, each replaced only when it beat
+the deployed model on a held-out slice with a pinned judge): 8 of 9 improved (+0.014 to +0.105,
+mostly reason+kb/reason winners); tau-bench regressed under `high` (0.869 → 0.828, its shipped
+model had heavier GEPA than `high` reproduces) and was kept — the only-replace-if-better gate
+working as intended.
 
 Hard-won learnings that shaped the harness: GEPA budgets must be iteration-denominated with a
 step-capped valset (a "budget 50" build once hit ~7,000 predict+judge pairs; a

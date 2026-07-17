@@ -408,11 +408,21 @@ def run_build_wizard(
         console.print("  [yellow]pick a different judge model[/yellow]")
         judge_default = judge_model
 
-    # Build effort is a tier, not an iteration count — raw budgets live in the Python API.
+    # Build effort is a tier, not an iteration count (raw budgets live in the Python API).
+    # `low` picks the corpus-signature's estimated-best config for free; the searching tiers
+    # spend more to find (and verify) a config that beats that estimate — each is floored at the
+    # low estimate, so more build effort never ships worse than low. The chosen config activates
+    # at serve time with `--max-fidelity` (a plain `wmh serve` stays pure RAG).
     console.print(
-        "  [dim]low: RAG only · medium: +light prompt optimization + cheap-lever search · "
-        "high: +optimization + config search · max: deep optimization + full search[/dim]"
+        "  [dim]low estimates the best config free; medium/high/max search harder for one that "
+        "beats it (floored at low). Serve the chosen config with --max-fidelity.[/dim]"
     )
+    fidelity_notes = {
+        "low": "free · the estimated-best config for your traces, no search",
+        "medium": "+ light prompt optimization & a cheap-lever search over low",
+        "high": "+ full config search (knowledge/verify/grounding) — recommended",
+        "max": "+ deep optimization & exhaustive search — highest cost, to be certain",
+    }
     fidelity = _select(
         console,
         ask,
@@ -420,6 +430,7 @@ def run_build_wizard(
         ["low", "medium", "high", "max"],
         defaults.fidelity,
         interactive=interactive,
+        notes=fidelity_notes,
     )
 
     # Retrieval phi embedder: offline lexical hashing is the measured-best default at EVERY
