@@ -188,6 +188,8 @@ class _FakeCommands:
     ) -> None:
         self._handle = handle
         self._reconnect_handles = list(reconnect_handles or [])
+        self.connect_started = threading.Event()
+        self.connect_gate: threading.Event | None = None
         self.calls: list[str] = []  # foreground commands, in order (installs, ...)
         self.background_cmds: list[str] = []
         self.background_envs: list[dict[str, str] | None] = []
@@ -221,6 +223,9 @@ class _FakeCommands:
 
     def connect(self, pid: int, *, timeout: float | None = None) -> object:
         self.connects.append((pid, timeout))
+        self.connect_started.set()
+        if self.connect_gate is not None:
+            self.connect_gate.wait(2.0)
         if not self._reconnect_handles:
             raise RuntimeError("process connection unavailable")
         return self._reconnect_handles.pop(0)
@@ -1597,6 +1602,128 @@ def test_durable_channel_recovers_after_stdout_drops() -> None:
     assert channel.recv(timeout=0.5) == hello
     assert channel.recv(timeout=0.5) == idle
     assert "Server disconnected" in channel.stderr_tail()
+
+
+def test_durable_channel_resume_preserves_both_sequence_cursors() -> None:
+    """A memory-preserving sandbox resume reattaches without replaying either direction."""
+    hello: JsonObject = {"type": "hello"}
+    idle: JsonObject = {"type": "state", "status": "idle"}
+    running: JsonObject = {"type": "state", "status": "running"}
+    handle = _ScriptedHandle(
+        _stdout_events([_envelope(1, hello), _envelope(2, idle)]),
+        hold_open=True,
+    )
+    resumed = _ScriptedHandle(_stdout_events([_envelope(4, running)]), hold_open=True)
+    fake = FakeSandbox(handle, reconnect_handles=[resumed])
+    _store_outbox(fake, [hello, idle])
+    channel = _durable_channel(fake, handle)
+
+    assert channel.recv(timeout=0.5) == hello
+    assert channel.recv(timeout=0.5) == idle
+    first: JsonObject = {"type": "user_message", "text": "first"}
+    channel.send(first)
+
+    fake.files.store[_frame_path(4)] = json.dumps(_envelope(4, running))
+    fake.files.store[f"{_OUTBOX}/head"] = "4"
+    previous_reader = channel._reader  # noqa: SLF001
+    channel.resume(fake)
+
+    assert fake.commands.connects == [(_PID, 0)]
+    previous_reader.join(timeout=0.5)
+    assert not previous_reader.is_alive()
+    assert channel._stream_dead_at is None  # noqa: SLF001
+    assert channel.recv(timeout=0.5) == running
+    second: JsonObject = {"type": "user_message", "text": "second"}
+    channel.send(second)
+
+    wires = [
+        cast("JsonObject", json.loads(base64.b64decode(data.strip())))
+        for _pid, data in fake.commands.stdin
+    ]
+    assert [wire["transport_in_seq"] for wire in wires] == [1, 2]
+    assert fake.durable_dispatches == [first, second]
+
+
+def test_durable_channel_resume_fences_a_concurrent_old_liveness_probe() -> None:
+    """A recv racing reconnect cannot poison the resumed channel with the old PID state."""
+    hello: JsonObject = {"type": "hello"}
+    handle = _DisconnectingHandle(_stdout_events([_envelope(1, hello)]))
+    resumed = _ScriptedHandle([], hold_open=True)
+    fake = FakeSandbox(handle, reconnect_handles=[resumed])
+    _store_outbox(fake, [hello])
+    channel = _durable_channel(fake, handle, frame_read_grace_s=0.01)
+    assert channel.recv(timeout=0.5) == hello
+    deadline = time.monotonic() + 0.5
+    while channel._stream_dead_at is None and time.monotonic() < deadline:  # noqa: SLF001
+        time.sleep(0.001)
+    assert channel._stream_dead_at is not None  # noqa: SLF001
+
+    release_connect = threading.Event()
+    fake.commands.connect_gate = release_connect
+    fake.commands.running_pids.clear()
+    resume_errors: list[Exception] = []
+    recv_errors: list[Exception] = []
+
+    def resume() -> None:
+        try:
+            channel.resume(fake)
+        except Exception as error:  # noqa: BLE001 - asserted below
+            resume_errors.append(error)
+
+    def recv() -> None:
+        try:
+            channel.recv(timeout=0.1)
+        except Exception as error:  # noqa: BLE001 - asserted below
+            recv_errors.append(error)
+
+    resume_thread = threading.Thread(target=resume)
+    resume_thread.start()
+    assert fake.commands.connect_started.wait(0.5)
+    recv_thread = threading.Thread(target=recv)
+    recv_thread.start()
+    time.sleep(0.04)
+    fake.commands.running_pids.add(_PID)
+    release_connect.set()
+    resume_thread.join(timeout=0.5)
+    recv_thread.join(timeout=0.5)
+
+    assert not resume_thread.is_alive()
+    assert not recv_thread.is_alive()
+    assert resume_errors == []
+    assert len(recv_errors) == 1
+    assert isinstance(recv_errors[0], TimeoutError)
+    assert channel._fatal_error is None  # noqa: SLF001
+
+
+def test_durable_channel_resume_rejects_a_fatal_state_set_during_connect() -> None:
+    """The post-connect guard cannot return a newly attached but poisoned channel."""
+    handle = _ScriptedHandle([], hold_open=True)
+    resumed = _ScriptedHandle([], hold_open=True)
+    fake = FakeSandbox(handle, reconnect_handles=[resumed])
+    _store_outbox(fake, [])
+    channel = _durable_channel(fake, handle)
+    release_connect = threading.Event()
+    fake.commands.connect_gate = release_connect
+    resume_errors: list[Exception] = []
+
+    def resume() -> None:
+        try:
+            channel.resume(fake)
+        except Exception as error:  # noqa: BLE001 - asserted below
+            resume_errors.append(error)
+
+    resume_thread = threading.Thread(target=resume)
+    resume_thread.start()
+    assert fake.commands.connect_started.wait(0.5)
+    with channel._state_lock:  # noqa: SLF001
+        channel._mark_fatal_locked("simulated concurrent fatal state")  # noqa: SLF001
+    release_connect.set()
+    resume_thread.join(timeout=0.5)
+
+    assert not resume_thread.is_alive()
+    assert len(resume_errors) == 1
+    assert "simulated concurrent fatal state" in str(resume_errors[0])
+    assert resumed.disconnects == 1
 
 
 def test_durable_channel_retries_a_transiently_missing_committed_frame() -> None:
