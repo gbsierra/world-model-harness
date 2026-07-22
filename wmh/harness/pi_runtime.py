@@ -140,6 +140,14 @@ _params_schema = params_schema
 class _ShimServer(ThreadingHTTPServer):
     """A threading HTTP server that carries the current episode for its handlers."""
 
+    # Environment calls mutate evaluator-owned state, so server_close() must join every active
+    # handler: no environment write may land after the episode is declared finished (against a
+    # real execution environment a late write would mutate state the evaluator is already
+    # verifying; with the world model it was merely cosmetic). The join is bounded by whatever
+    # the slowest handler is blocked on, worst case a completion handler waiting out the provider
+    # SDK's timeout and retries (minutes during an outage), not just a tool command's budget. A
+    # slow close is the accepted price of a trustworthy verdict.
+    daemon_threads = False
     episode: _Episode
 
 

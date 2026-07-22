@@ -13,6 +13,7 @@ from wmh.harness.doc import (
     HarnessDoc,
     Surface,
     SurfaceKind,
+    code_surface_id,
 )
 from wmh.harness.skills import Skill
 
@@ -41,6 +42,20 @@ def test_surface_id_must_match_kind() -> None:
         Surface(id="prompt:Not Kebab", kind=SurfaceKind.PROMPT, content="x")
 
 
+def test_trailing_newline_never_slips_past_id_or_path_validation() -> None:
+    # `$` in re.match also matches before a final newline; the validators must use fullmatch
+    # or a newline-carrying surface passes here and fails only at render/reparse time.
+    with pytest.raises(ValidationError, match="matching its kind"):
+        Surface(id="prompt:core\n", kind=SurfaceKind.PROMPT, content="x")
+    with pytest.raises(ValidationError, match="unsafe path"):
+        Surface(
+            id=code_surface_id("src/agent.ts"),
+            kind=SurfaceKind.CODE,
+            content="x",
+            path="src/agent.ts\n",
+        )
+
+
 def test_budget_is_enforced_at_construction() -> None:
     Surface(id="prompt:core", kind=SurfaceKind.PROMPT, content="ok", budget=10)
     with pytest.raises(ValidationError, match="over its budget"):
@@ -63,6 +78,80 @@ def test_doc_hash_is_content_and_order_independent() -> None:
     assert doc1.doc_hash == doc2.doc_hash  # identity is the surfaces, nothing else
     doc3 = HarnessDoc(name="x", surfaces=[a.model_copy(update={"content": "A2"}), b])
     assert doc3.doc_hash != doc1.doc_hash
+
+
+def test_doc_hash_includes_materialized_paths_and_ignores_display_metadata() -> None:
+    # "src/worker.ts" and "src.worker.ts" both map (lossily) to id "code:src-worker-ts", so the
+    # id and content alone cannot tell these two materializations apart; the hash must.
+    first = HarnessDoc(
+        name="first",
+        version=1,
+        surfaces=[
+            Surface(id="prompt:main", kind=SurfaceKind.PROMPT, content="prompt"),
+            Surface(
+                id="code:src-worker-ts",
+                kind=SurfaceKind.CODE,
+                content="export const value = 1;",
+                path="src/worker.ts",
+            ),
+        ],
+    )
+    renamed = first.model_copy(update={"name": "renamed", "version": 99})
+    moved = HarnessDoc(
+        name="moved",
+        surfaces=[
+            Surface(id="prompt:main", kind=SurfaceKind.PROMPT, content="prompt"),
+            Surface(
+                id="code:src-worker-ts",
+                kind=SurfaceKind.CODE,
+                content="export const value = 1;",
+                path="src.worker.ts",
+            ),
+        ],
+    )
+
+    assert renamed.doc_hash == first.doc_hash
+    assert moved.doc_hash != first.doc_hash
+    # The legacy identity (pull compatibility only) predates path coverage: it cannot tell the
+    # moved document apart, which is exactly why doc_hash now includes paths.
+    assert first.legacy_doc_hash == moved.legacy_doc_hash
+    assert first.legacy_doc_hash != first.doc_hash
+
+
+def test_pathless_doc_hash_matches_its_legacy_hash() -> None:
+    doc = HarnessDoc.baseline("base")
+    assert doc.doc_hash == doc.legacy_doc_hash
+
+
+def test_code_surface_path_must_derive_its_id() -> None:
+    Surface(id="code:src-agent-ts", kind=SurfaceKind.CODE, path="src/agent.ts", content="// ok")
+    with pytest.raises(ValidationError, match="must use id 'code:src-agent-ts'"):
+        Surface(id="code:other", kind=SurfaceKind.CODE, path="src/agent.ts", content="// no")
+
+
+@pytest.mark.parametrize("path", ["src/agent_utils.ts", "Upper.ts", "src/a..b.ts"])
+def test_code_surface_rejects_paths_outside_the_id_grammar(path: str) -> None:
+    with pytest.raises(ValidationError, match="kebab-slug"):
+        Surface(id="code:whatever", kind=SurfaceKind.CODE, path=path, content="x")
+
+
+@pytest.mark.parametrize("path", ["./x.ts", "src/./x.ts", "src//x.ts", "/abs.ts", "a/../b.ts"])
+def test_code_surface_rejects_noncanonical_paths(path: str) -> None:
+    with pytest.raises(ValidationError, match="canonical relative POSIX path"):
+        Surface(id="code:x-ts", kind=SurfaceKind.CODE, path=path, content="x")
+
+
+@pytest.mark.parametrize("path", ["doc.json", "aliases.toml"])
+def test_code_surface_rejects_store_metadata_paths(path: str) -> None:
+    with pytest.raises(ValidationError, match="store metadata"):
+        Surface(id=code_surface_id(path), kind=SurfaceKind.CODE, path=path, content="x")
+
+
+def test_code_runtime_surface_must_be_pathless() -> None:
+    # A file named exactly `runtime` would mint a pathful code:runtime that hijacks the
+    # in-process runtime module and collides with the rendered runtime.py on reparse.
+    with pytest.raises(ValidationError, match="must not carry a path"):
+        Surface(id="code:runtime", kind=SurfaceKind.CODE, path="runtime", content="x")
 
 
 def test_duplicate_surface_ids_rejected() -> None:
@@ -181,7 +270,9 @@ def _pi_doc() -> HarnessDoc:
             Surface(id=RUNTIME_KIND_ID, kind=SurfaceKind.PARAM, content="pi-node"),
             Surface(id=MAX_TURNS_ID, kind=SurfaceKind.PARAM, content="7"),
             Surface(id=MAX_OUTPUT_TOKENS_ID, kind=SurfaceKind.PARAM, content="16384"),
-            Surface(id="code:a", kind=SurfaceKind.CODE, path="src/agent.ts", content="// a"),
+            Surface(
+                id="code:src-agent-ts", kind=SurfaceKind.CODE, path="src/agent.ts", content="// a"
+            ),
         ],
     )
 
