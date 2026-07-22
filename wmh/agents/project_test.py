@@ -2,11 +2,18 @@
 
 from __future__ import annotations
 
+import base64
+import json
+import subprocess
+import sys
+from pathlib import Path
+
 import pytest
 from llm_waterfall import ChatResponse
 
 from wmh.agents import project as project_module
 from wmh.agents.meta import meta_agent
+from wmh.agents.optimizer import optimizer_agent
 from wmh.agents.project import AgentProject
 from wmh.core.types import JsonObject
 from wmh.harness import e2b_sandbox as e2b_sandbox_module
@@ -14,6 +21,7 @@ from wmh.harness.doc import TOOL_POLICY_ID, HarnessDoc
 from wmh.harness.e2b_sandbox import SandboxCleanupError, SandboxUsage
 from wmh.harness.live_session import SessionEvent
 from wmh.harness.runtime import HarnessSearchCancelled
+from wmh.harness.source_tree import HarnessSourceFile, HarnessSourceTree
 from wmh.providers.base import ProviderConfig, ProviderKind
 
 
@@ -1235,9 +1243,13 @@ def test_agent_file_tools_reject_paths_outside_the_project() -> None:
         assert "escapes project workspace" in outcome.content
 
 
-@pytest.mark.parametrize("tool", ["bash", "read_skill"])
+@pytest.mark.parametrize("tool", ["read_skill"])
 def test_project_rejects_agents_with_uncontained_tools(tool: str) -> None:
-    """The project still rejects capabilities outside its isolated tool allowlist."""
+    """The project still rejects capabilities outside its isolated tool allowlist.
+
+    `bash` moved INTO the allowlist for the harbor optimizer's proposer turns (it executes in
+    the project sandbox as the default user), so only genuinely unrouted tools remain rejected.
+    """
     base = meta_agent()
     uncontained = HarnessDoc(
         name="uncontained",
@@ -1252,3 +1264,205 @@ def test_project_rejects_agents_with_uncontained_tools(tool: str) -> None:
 
     with pytest.raises(ValueError, match=f"uncontained tools: {tool}"):
         project.run(uncontained, _Provider(), "escape", timeout=1)
+
+
+# -- bash, stage/snapshot, and single-attempt runs (the harbor proposer surface) --------------
+
+
+class _ScriptedCommands(_Commands):
+    """Commands fake with scripted responses for bash and snapshot commands."""
+
+    def __init__(self, files: _Files | None = None) -> None:
+        super().__init__(files)
+        self.responses: list[object] = []
+
+    def run(self, cmd: str, background: bool | None = None, **kwargs: object) -> _Output:
+        if self.responses and (cmd.startswith(("cd ", "python3 -c"))):
+            self.runs.append(cmd)
+            item = self.responses.pop(0)
+            if isinstance(item, Exception):
+                raise item
+            assert isinstance(item, _Output)
+            return item
+        return super().run(cmd, background, **kwargs)
+
+
+class _ExitError(RuntimeError):
+    """E2B's CommandExitException shape: a raised failure carrying the finished streams."""
+
+    def __init__(self, *, stdout: str = "", stderr: str = "", exit_code: int = 1) -> None:
+        super().__init__(f"exit {exit_code}")
+        self.stdout = stdout
+        self.stderr = stderr
+        self.exit_code = exit_code
+
+
+def _scripted_project(responses: list[object]) -> tuple[AgentProject, _ScriptedCommands]:
+    sandbox = _Sandbox()
+    commands = _ScriptedCommands(sandbox.files)
+    sandbox.commands = commands
+    project = AgentProject(
+        sandbox, channel_factory=lambda sandbox, workspace: _Channel(), owns_sandbox=False
+    )
+    commands.responses = responses
+    return project, commands
+
+
+def test_bash_tool_reports_nonzero_exit_as_output_not_a_crash() -> None:
+    project, commands = _scripted_project(
+        [_ExitError(stdout="partial", stderr="boom", exit_code=2)]
+    )
+
+    outcome = project._execute_tool("bash", {"command": "false"}, lambda stream, data: None)
+
+    assert outcome.is_error is True
+    assert "partial" in outcome.content
+    assert "boom" in outcome.content
+    assert "[exit 2]" in outcome.content
+    command = commands.runs[-1]
+    assert command.startswith("cd /home/user/project && timeout --kill-after=10s 60s ")
+    assert "bash --noprofile --norc -c false" in command
+
+
+def test_run_bash_truncates_streams_head_and_tail() -> None:
+    big = "a" * 20_000 + "MIDDLE" + "b" * 20_000
+    project, _commands = _scripted_project([_Output(stdout=big)])
+
+    result = project.run_bash("cat big")
+
+    assert result.exit_code == 0
+    assert "characters truncated" in result.stdout
+    assert result.stdout.startswith("aaa")
+    assert result.stdout.endswith("bbb")
+    assert "MIDDLE" not in result.stdout
+
+
+def test_run_bash_propagates_transport_failures() -> None:
+    project, _commands = _scripted_project([RuntimeError("connection reset by peer")])
+
+    with pytest.raises(RuntimeError, match="connection reset"):
+        project.run_bash("ls")
+
+
+def test_stage_and_snapshot_source_tree_roundtrip() -> None:
+    tree = HarnessSourceTree(
+        files=(
+            HarnessSourceFile(path="SYSTEM.md", content="hello"),
+            HarnessSourceFile(path="src/agent-loop.ts", content="export {};"),
+        )
+    )
+    payload = json.dumps(
+        {
+            "files": [
+                {
+                    "path": item.path,
+                    "content_base64": base64.b64encode(item.content.encode()).decode(),
+                }
+                for item in tree.files
+            ]
+        }
+    )
+    project, commands = _scripted_project([_Output(stdout=payload)])
+
+    project.stage_source_tree(tree, "candidate")
+    assert commands.files is not None
+    assert commands.files.values["/home/user/project/candidate/SYSTEM.md"] == "hello"
+
+    snapshot = project.snapshot_source_tree("candidate", max_files=10, max_bytes=1_000)
+    assert snapshot == tree
+    command = commands.runs[-1]
+    assert command.startswith("python3 -c")
+    assert command.endswith("/home/user/project/candidate 10 1000 1024")
+
+
+def test_snapshot_source_tree_surfaces_in_sandbox_failures() -> None:
+    project, _commands = _scripted_project(
+        [_Output(stderr="directory exceeds the 10 file bound", exit_code=2)]
+    )
+
+    with pytest.raises(RuntimeError, match="10 file bound"):
+        project.snapshot_source_tree("candidate", max_files=10, max_bytes=1_000)
+
+
+def test_snapshot_script_walks_regular_files_and_counts_skipped_entries(
+    tmp_path: Path,
+) -> None:
+    """The trusted in-sandbox walk: sorted regular files, symlinks REPORTED, bounds."""
+    (tmp_path / "src").mkdir()
+    (tmp_path / "SYSTEM.md").write_text("hi", encoding="utf-8")
+    (tmp_path / "src" / "loop.ts").write_text("x", encoding="utf-8")
+    (tmp_path / "link.md").symlink_to(tmp_path / "SYSTEM.md")
+    (tmp_path / "link-dir").symlink_to(tmp_path / "src")
+    script = project_module._SNAPSHOT_SOURCE_TREE_SCRIPT
+
+    done = subprocess.run(
+        [sys.executable, "-c", script, str(tmp_path), "10", "1000", "1024"],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    data = json.loads(done.stdout)
+    assert [item["path"] for item in data["files"]] == ["SYSTEM.md", "src/loop.ts"]
+    # Non-regular entries are counted, never silently dropped from the candidate.
+    assert data["skipped"] == ["link-dir", "link.md"]
+
+    over = subprocess.run(
+        [sys.executable, "-c", script, str(tmp_path), "10", "1", "1024"],
+        capture_output=True,
+        text=True,
+    )
+    assert over.returncode == 2
+    assert "byte bound" in over.stderr
+
+
+def test_snapshot_source_tree_rejects_candidates_with_non_regular_entries() -> None:
+    payload = json.dumps({"files": [], "skipped": ["candidate/link.md"]})
+    project, _commands = _scripted_project([_Output(stdout=payload)])
+
+    with pytest.raises(RuntimeError, match="candidate/link.md"):
+        project.snapshot_source_tree("candidate", max_files=10, max_bytes=1_000)
+
+
+def test_run_retry_recoverable_false_is_single_attempt_and_closes_the_session() -> None:
+    """A recoverable transport death must not replay a paid proposal turn."""
+
+    class _DisconnectChannel(_Channel):
+        def __init__(self) -> None:
+            super().__init__()
+            self.inbound = [
+                {"type": "state", "status": "idle"},
+                {"type": "state", "status": "running"},
+            ]
+
+        def recv(self, timeout: float | None = None) -> JsonObject | None:
+            if self.inbound:
+                return super().recv(timeout)
+            raise RuntimeError("server disconnected")
+
+    replacement = _Sandbox()
+    project = AgentProject(
+        _Sandbox(),
+        channel_factory=lambda sandbox, workspace: _DisconnectChannel(),
+        sandbox_factory=lambda: pytest.fail("retry_recoverable=False must not replace"),
+    )
+
+    with pytest.raises(RuntimeError, match="server disconnected"):
+        project.run(meta_agent(), _Provider(), "propose", timeout=1, retry_recoverable=False)
+
+    assert replacement.killed is False
+    assert project._session is None  # the poisoned session is never reused by a later run
+
+
+def test_bash_capable_agents_must_run_single_attempt() -> None:
+    """Shell writes bypass the replayable host mirror, so a transparently retried turn could
+    replay onto a replacement sandbox missing them; run() rejects that combination outright
+    instead of silently downgrading the retry."""
+    project = AgentProject(_Sandbox(), channel_factory=lambda sandbox, workspace: _Channel())
+
+    with pytest.raises(ValueError, match="retry_recoverable=False"):
+        project.run(optimizer_agent(), _Provider(), "propose", timeout=1)
+
+    result = project.run(
+        optimizer_agent(), _Provider(), "propose", timeout=1, retry_recoverable=False
+    )
+    assert result.answer == "finished"

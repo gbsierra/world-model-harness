@@ -11,28 +11,61 @@ steers what the agent's scaffold should be. Run one closed-loop with
 
 from __future__ import annotations
 
+import asyncio
+import json
 import shlex
 from pathlib import Path
+from typing import Literal
 
 import typer
+from pydantic import BaseModel, ConfigDict, ValidationError
 from rich.console import Console
 from rich.markup import escape
 from rich.prompt import Confirm, IntPrompt, Prompt
 from rich.table import Table
 
-from wmh.cli.model_roles import resolve_opt_in_model_provider
+from wmh.agents.default import default_agent
+from wmh.agents.optimizer import optimizer_agent
+from wmh.agents.project import AgentProject
+from wmh.cli.model_roles import resolve_opt_in_model_provider, resolve_required_model_config
 from wmh.config import ARTIFACT_DIR, WorldModelStore
 from wmh.config.store import validate_name
+from wmh.core.types import JsonObject
 from wmh.engine import load_world_model
 from wmh.engine.world_model import WorldModel
 from wmh.evals.gold import GoldJudge
 from wmh.evals.tasks import TaskSpec, load_tasks
 from wmh.harness.create import ProposalRecord, create_harness
 from wmh.harness.doc import HarnessDoc
-from wmh.harness.e2b_sandbox import E2B_TEMPLATE_ENV
+from wmh.harness.e2b_sandbox import E2B_TEMPLATE_ENV, resolve_e2b_template
+from wmh.harness.population import (
+    CandidateProposer,
+    PopulationResult,
+    PopulationRunState,
+    SlotOutcome,
+    write_json_atomic,
+)
+from wmh.harness.population import (
+    optimize as optimize_population,
+)
+from wmh.harness.project_proposer import CandidateProject, ProjectCandidateProposer
 from wmh.harness.proposer import ProviderDeltaProposer
+from wmh.harness.runtime import DEFAULT_EVAL_EPISODE_TIMEOUT_S
+from wmh.harness.scoring import RewardMode, Scorer, ScoreRequest
+from wmh.harness.source_tree import HarnessSourceTree
 from wmh.harness.store import CHAMPION_ALIAS, HarnessStore
-from wmh.providers.base import Provider
+from wmh.providers.base import Provider, ProviderConfig, ToolCallingProvider
+from wmh.providers.registry import get_provider
+
+# The default agent seed's literal CLI name: `wmh optimize pi harbor ...` starts from the
+# built-in pi agent and publishes new versions under the store name "pi".
+DEFAULT_SEED_AGENT = "pi"
+_DEFAULT_HARBOR_ITERATIONS = 10
+_HARBOR_ENVIRONMENT = "harbor"
+_HARBOR_EXTRA_HINT = (
+    "the harbor environment needs the harbor extra; run `uv sync --extra harbor` "
+    "(or `pip install 'world-model-harness[harbor]'`)"
+)
 
 harness_app = typer.Typer(
     help="Inspect and initialize named, versioned agent harnesses.",
@@ -96,10 +129,18 @@ def show_harness(
 
 
 def optimize(
-    name: str = typer.Argument(None, help="Agent name for the optimized harness."),
+    ctx: typer.Context,
+    name: str = typer.Argument(
+        None,
+        help="Agent name for the optimized harness. For the harbor environment this is the "
+        "seed and the publication target: the bare literal 'pi' is ALWAYS the built-in "
+        "default agent (fixed-seed protocol), even after a stored 'pi' champion exists; "
+        "seed from a stored version explicitly with 'pi@champion' or 'pi@vN'.",
+    ),
     model: str = typer.Argument(
         None,
-        help="World model to optimize against (default: the only built one).",
+        help="World model to optimize against (default: the only built one), or the literal "
+        "'harbor' to optimize on real harbor benchmark tasks.",
     ),
     tasks_file: str = typer.Option(None, "--tasks", help="JSONL task file to optimize against."),
     holdout_file: str = typer.Option(
@@ -132,7 +173,12 @@ def optimize(
         "--seed",
         help="Harness to start from, as a name or name@version (default: built-in baseline).",
     ),
-    iterations: int = typer.Option(None, min=1, help="Propose-and-gate steps (the search budget)."),
+    iterations: int = typer.Option(
+        None,
+        min=0,
+        help="Propose-and-gate steps (the search budget). 0 scores the seed only (harbor env), "
+        "the way a baseline or a frozen champion is scored on a task set.",
+    ),
     proposal_batch_size: int = typer.Option(
         1,
         "--proposal-batch-size",
@@ -145,15 +191,137 @@ def optimize(
         None, "--archive", help="Also write the full delta archive JSON here."
     ),
     yes: bool = typer.Option(False, "--yes", help="Skip the cost confirmation prompt."),
+    harbor_config: str = typer.Option(
+        None,
+        "--harbor-config",
+        help="(harbor) Harbor JobConfig template, YAML or JSON: the task-environment config "
+        "and harbor tuning, with exactly one dataset and no direct tasks.",
+    ),
+    task_ids_file: str = typer.Option(
+        None,
+        "--task-ids",
+        help="(harbor) JSON file containing the exact task-id string list to optimize on.",
+    ),
+    attempts: int = typer.Option(
+        None, "--attempts", min=1, help="(harbor) Attempts per task per candidate (default 1)."
+    ),
+    reward_key: str = typer.Option(
+        None,
+        "--reward-key",
+        help="(harbor) Verifier reward key to optimize (default 'reward').",
+    ),
+    reward_mode: str = typer.Option(
+        None,
+        "--reward-mode",
+        help="(harbor) raw | positive-binary (default positive-binary: reward > 0 passes).",
+    ),
+    harbor_retries: int = typer.Option(
+        None,
+        "--harbor-retries",
+        min=0,
+        help="(harbor) Harbor-level retries per failed trial (default 0).",
+    ),
+    episode_timeout: float = typer.Option(
+        None,
+        "--episode-timeout",
+        min=0.001,
+        help="(harbor) Wall seconds per evaluated episode (default 300; needs --backend e2b).",
+    ),
+    run_dir: str = typer.Option(
+        None,
+        "--run-dir",
+        help="(harbor) Directory holding ALL durable run state (required for harbor).",
+    ),
+    resume: bool = typer.Option(
+        False,
+        "--resume",
+        help="(harbor) Continue the interrupted run recorded in --run-dir.",
+    ),
+    max_iterations_this_run: int = typer.Option(
+        None,
+        "--max-iterations-this-run",
+        min=1,
+        help="(harbor) Stop after this many new boundaries this invocation; continue later "
+        "with --resume.",
+    ),
 ) -> None:
-    """Optimize an agent harness by searching against a world model.
+    """Optimize an agent harness by searching against a world model or on harbor tasks.
 
-    The optimizer proposes harness changes, scores them against the simulated environment, and
-    saves the best gated result as the new champion. Configure distinct agent and optimizer models
-    with `models.agent` and `models.meta` in `.wmh/settings.toml`.
+    The optimizer proposes harness changes, scores them against the environment, and saves the
+    best result as the new champion. Configure distinct agent and optimizer models with
+    `models.agent` and `models.meta` in `.wmh/settings.toml`.
 
-    The backend controls where the worker process runs. The environment remains the world model.
+    With a world-model ENVIRONMENT, the backend controls where the worker process runs and the
+    environment remains the world model. With the literal `harbor` ENVIRONMENT, complete-source
+    candidates are scored on real benchmark tasks: --backend controls the task environment and
+    worker placement (local = docker tasks + local pi; e2b = E2B tasks + sandboxed pi), while
+    the PROPOSER project always runs in E2B in this version.
     """
+    if model == _HARBOR_ENVIRONMENT:
+        world_model_only = [
+            flag
+            for param, flag in (
+                ("tasks_file", "--tasks"),
+                ("holdout_file", "--holdout"),
+                ("seed", "--seed"),
+                ("k", "--k"),
+                ("eval_concurrency", "--eval-concurrency"),
+                ("proposal_batch_size", "--proposal-batch-size"),
+                ("archive_out", "--archive"),
+            )
+            if _explicit(ctx, param)
+        ]
+        if world_model_only:
+            raise typer.BadParameter(
+                f"{', '.join(world_model_only)} apply only to a world-model environment; "
+                "drop them for `wmh optimize <agent> harbor ...`"
+            )
+        _optimize_harbor(
+            ctx,
+            name=name,
+            backend=backend,
+            e2b_template=e2b_template,
+            iterations=iterations,
+            harbor_config=harbor_config,
+            task_ids_file=task_ids_file,
+            attempts=attempts,
+            reward_key=reward_key,
+            reward_mode=reward_mode,
+            harbor_retries=harbor_retries,
+            episode_timeout=episode_timeout,
+            run_dir_option=run_dir,
+            resume=resume,
+            max_iterations_this_run=max_iterations_this_run,
+            root=root,
+            yes=yes,
+        )
+        return
+    harbor_only = [
+        flag
+        for flag, provided in (
+            ("--harbor-config", harbor_config is not None),
+            ("--task-ids", task_ids_file is not None),
+            ("--attempts", attempts is not None),
+            ("--reward-key", reward_key is not None),
+            ("--reward-mode", reward_mode is not None),
+            ("--harbor-retries", harbor_retries is not None),
+            ("--episode-timeout", episode_timeout is not None),
+            ("--run-dir", run_dir is not None),
+            ("--resume", resume),
+            ("--max-iterations-this-run", max_iterations_this_run is not None),
+        )
+        if provided
+    ]
+    if harbor_only:
+        raise typer.BadParameter(
+            f"{', '.join(harbor_only)} apply only to the harbor environment; "
+            "use `wmh optimize <agent> harbor ...`"
+        )
+    if iterations == 0:
+        raise typer.BadParameter(
+            "--iterations 0 (score-only) applies only to the harbor environment; "
+            "world-model optimization needs at least one search iteration"
+        )
     interactive = _console.is_terminal
     if name is None:
         if not interactive:
@@ -327,6 +495,514 @@ def _load_world_model(name: str | None, root: str) -> tuple[WorldModel, Provider
         raise typer.BadParameter(str(exc)) from exc
     world_model, provider = load_world_model(model_dir)
     return world_model, provider, model_dir.name
+
+
+# -- the harbor environment: complete-source population optimization on real tasks ------------
+
+
+class _HarborRunConfig(BaseModel):
+    """The resolved harbor optimize configuration persisted as `run-config.json`."""
+
+    model_config = ConfigDict(frozen=True)
+
+    agent: str
+    attempts: int
+    backend: Literal["local", "e2b"]
+    e2b_template: str | None
+    episode_timeout_s: float
+    # The PARSED RAW job template mapping, never a harbor model_dump (which would redact
+    # sensitive-named env values that differ from this process's environment).
+    harbor_job_template: JsonObject
+    harbor_retries: int
+    iterations: int
+    # The worker and proposer model identities resolved at run start; a resume re-resolves the
+    # roles and rejects a mismatch so a mid-run settings.toml edit cannot silently change what
+    # is being scored or who is proposing.
+    proposer_model: JsonObject
+    worker_model: JsonObject
+    reward_key: str
+    reward_mode: RewardMode
+    # The stored-seed version this run started from; None means the built-in default agent.
+    # Resumes load the seed from the run dir itself, so champion movement (including this
+    # run's own publication) can never re-resolve the seed to a different tree.
+    seed_version: int | None
+    task_ids: tuple[str, ...]
+    # Per-task provenance pins (git commit / package ref / local path) resolved on the first
+    # run; None until the dataset has resolved once. A resume that resolves differently is
+    # rejected instead of silently scoring different task bytes.
+    task_pins: JsonObject | None = None
+
+
+def _model_identity(config: ProviderConfig) -> JsonObject:
+    """The provider identity fields a run pins (and a resume must re-resolve identically)."""
+    return {
+        "provider": config.kind.value,
+        "model": config.model,
+        "deployment": config.deployment,
+        "region": config.region,
+        "reasoning_effort": config.reasoning_effort,
+    }
+
+
+def _explicit(ctx: typer.Context, param: str) -> bool:
+    """Whether `param` was explicitly passed on the command line.
+
+    Compared by enum NAME: typer vendors click, so its ParameterSource enum is not
+    click.core's class and an identity check would silently never match.
+    """
+    source = ctx.get_parameter_source(param)
+    return source is not None and source.name == "COMMANDLINE"
+
+
+def _optimize_harbor(
+    ctx: typer.Context,
+    *,
+    name: str | None,
+    backend: str,
+    e2b_template: str | None,
+    iterations: int | None,
+    harbor_config: str | None,
+    task_ids_file: str | None,
+    attempts: int | None,
+    reward_key: str | None,
+    reward_mode: str | None,
+    harbor_retries: int | None,
+    episode_timeout: float | None,
+    run_dir_option: str | None,
+    resume: bool,
+    max_iterations_this_run: int | None,
+    root: str,
+    yes: bool,
+) -> None:
+    """Run the harbor population optimizer: fixed seed, sequential complete-source proposals."""
+    if name is None:
+        raise typer.BadParameter(
+            "provide the seed agent NAME (the literal 'pi' is the built-in default agent): "
+            "`wmh optimize pi harbor --harbor-config ... --task-ids ... --run-dir ...`"
+        )
+    if backend not in ("local", "e2b"):
+        raise typer.BadParameter(f"unknown --backend {backend!r}; choose local or e2b")
+    if reward_mode is not None and reward_mode not in ("raw", "positive-binary"):
+        raise typer.BadParameter(
+            f"unknown --reward-mode {reward_mode!r}; choose raw or positive-binary"
+        )
+    if run_dir_option is None:
+        raise typer.BadParameter(
+            "--run-dir is required for the harbor environment: it holds all durable run state"
+        )
+    if WorldModelStore(root).exists(_HARBOR_ENVIRONMENT):
+        raise typer.BadParameter(
+            "a stored world model is literally named 'harbor', which now selects the harbor "
+            "benchmark environment; rename that model directory under <root>/models/ and retry"
+        )
+
+    run_dir = Path(run_dir_option)
+    config_path = run_dir / "run-config.json"
+    meta_config = resolve_required_model_config(root, "meta")
+    agent_config = resolve_required_model_config(root, "agent")
+    if resume:
+        config = _resumed_harbor_config(
+            ctx,
+            config_path,
+            name=name,
+            backend=backend,
+            e2b_template=e2b_template,
+            iterations=iterations,
+            harbor_config=harbor_config,
+            task_ids_file=task_ids_file,
+            attempts=attempts,
+            reward_key=reward_key,
+            reward_mode=reward_mode,
+            harbor_retries=harbor_retries,
+            episode_timeout=episode_timeout,
+            meta_config=meta_config,
+            agent_config=agent_config,
+        )
+        seed_name, seed_tree = _resumed_harbor_seed(run_dir, root, config)
+    else:
+        if config_path.exists():
+            raise typer.BadParameter(
+                f"{run_dir} already holds a run; pass --resume to continue it or choose a "
+                "fresh --run-dir"
+            )
+        if harbor_config is None or task_ids_file is None:
+            raise typer.BadParameter(
+                "--harbor-config and --task-ids are required to start a harbor optimization"
+            )
+        seed_name, seed_tree, seed_version = _resolve_harbor_seed(root, name)
+        config = _HarborRunConfig(
+            agent=name,
+            attempts=attempts if attempts is not None else 1,
+            backend="e2b" if backend == "e2b" else "local",
+            e2b_template=resolve_e2b_template(e2b_template),
+            episode_timeout_s=(
+                episode_timeout if episode_timeout is not None else DEFAULT_EVAL_EPISODE_TIMEOUT_S
+            ),
+            harbor_job_template=_load_harbor_job_template(Path(harbor_config)),
+            harbor_retries=harbor_retries if harbor_retries is not None else 0,
+            iterations=iterations if iterations is not None else _DEFAULT_HARBOR_ITERATIONS,
+            proposer_model=_model_identity(meta_config),
+            worker_model=_model_identity(agent_config),
+            reward_key=reward_key if reward_key is not None else "reward",
+            reward_mode="raw" if reward_mode == "raw" else "positive-binary",
+            seed_version=seed_version,
+            task_ids=_load_harbor_task_ids(Path(task_ids_file)),
+        )
+    # Validated on the EFFECTIVE (stored-or-CLI) config: a consistent resume of an e2b run may
+    # restate --episode-timeout even though this invocation's --backend default is local.
+    if config.backend == "local" and config.episode_timeout_s != DEFAULT_EVAL_EPISODE_TIMEOUT_S:
+        raise typer.BadParameter("--episode-timeout requires --backend e2b")
+
+    _console.print(
+        f"harbor population search from [bold]{config.agent}[/bold]: 1 seed + "
+        f"{config.iterations} proposal slot(s), {len(config.task_ids)} task(s), "
+        f"{config.attempts} attempt(s), reward mode {config.reward_mode}, "
+        f"worker backend {config.backend} (proposer project: E2B) -> {run_dir}"
+    )
+    if _console.is_terminal and not yes and not Confirm.ask("Proceed?", default=True):
+        raise typer.Exit(0)
+
+    scorer, task_pins = _build_harbor_scorer(config, run_dir=run_dir, provider_config=agent_config)
+    if resume:
+        if config.task_pins is not None and task_pins != config.task_pins:
+            raise typer.BadParameter(
+                "the dataset resolved differently than this run recorded: "
+                f"recorded pins {config.task_pins}, resolved pins {task_pins}; restore the "
+                "recorded dataset revision or start a fresh --run-dir"
+            )
+    else:
+        # Recorded only now: the template validated, the user confirmed, and the dataset pins
+        # are known, so a declined or failed start never poisons the run dir.
+        config = config.model_copy(update={"task_pins": task_pins})
+        run_dir.mkdir(parents=True, exist_ok=True)
+        write_json_atomic(config_path, config.model_dump(mode="json"))
+    proposer = _build_harbor_proposer(
+        run_dir=run_dir, meta_config=meta_config, e2b_template=config.e2b_template
+    )
+
+    def _on_boundary(outcome: SlotOutcome) -> None:
+        if outcome.evaluated is None:
+            _console.print(
+                f"  [slot {outcome.slot}] {outcome.candidate_id}: "
+                f"[yellow]invalid[/yellow] ({escape(outcome.reason)})"
+            )
+        else:
+            tag = "seed" if outcome.slot == 0 else f"slot {outcome.slot}"
+            _console.print(f"  [{tag}] {outcome.candidate_id}: score={outcome.evaluated.score:.3f}")
+
+    result = optimize_population(
+        seed_tree,
+        scorer,
+        proposer,
+        config.iterations,
+        run_dir=run_dir,
+        max_new_boundaries=max_iterations_this_run,
+        on_boundary=_on_boundary,
+    )
+    if not result.completed:
+        _console.print(
+            f"[yellow]checkpointed[/yellow] {len(result.outcomes)}/{config.iterations + 1} "
+            f"boundaries; continue with: [bold]wmh optimize {config.agent} harbor --resume "
+            f"--run-dir {run_dir}[/bold]"
+        )
+        return
+    _publish_harbor_winner(result, root=root, seed_name=seed_name, run_dir=run_dir)
+
+
+def _publish_harbor_winner(
+    result: PopulationResult, *, root: str, seed_name: str, run_dir: Path
+) -> None:
+    """Save the score winner as the seed agent's next version, exactly once per run.
+
+    `published.json` is the run's publication record and is written LAST: a completed run
+    resumed again re-prints that record instead of appending a duplicate store version and
+    moving the champion alias a second time.
+    """
+    published_path = run_dir / "published.json"
+    if published_path.exists():
+        record = json.loads(published_path.read_text(encoding="utf-8"))
+        _console.print(
+            f"[green]already published[/green] [bold]{record.get('name')}[/bold] "
+            f"v{record.get('version')} (doc_hash={str(record.get('doc_hash'))[:12]}) "
+            f"from {record.get('best_candidate_id')}; evidence -> {run_dir}"
+        )
+        return
+    store = HarnessStore(root)
+    winner = result.best.source.to_doc(seed_name)
+    saved = store.save_version(winner, alias=CHAMPION_ALIAS)
+    write_json_atomic(
+        published_path,
+        {
+            "name": saved.name,
+            "version": saved.version,
+            "doc_hash": saved.doc_hash,
+            "best_candidate_id": result.best.candidate_id,
+            "best_score": result.best_score,
+        },
+    )
+    scored = sum(1 for outcome in result.outcomes if outcome.evaluated is not None)
+    _console.print(
+        f"[green]optimized[/green] [bold]{seed_name}[/bold] v{saved.version} (champion) "
+        f"score={result.best_score:.3f} from {result.best.candidate_id} "
+        f"({scored} scored, {len(result.outcomes) - scored} invalid slot(s)) "
+        f"-> {store.dir_for(seed_name)}; evidence -> {run_dir}"
+    )
+
+
+def _resumed_harbor_seed(
+    run_dir: Path, root: str, config: _HarborRunConfig
+) -> tuple[str, HarnessSourceTree]:
+    """The seed for a resumed run: the run dir's own record, never a live movable ref.
+
+    `candidates/candidate-0000/source` is authoritative once the seed boundary committed;
+    re-resolving the NAME live would let champion movement (including this run's own
+    publication) resolve a different tree and brick a legitimate resume. Before the first
+    boundary the seed is re-resolved from the PINNED version recorded at start.
+    """
+    seed_name = config.agent.partition("@")[0]
+    # load() only returns COMMITTED boundaries (state.json) and re-verifies each candidate's
+    # doc hash, so a crash that left a partial candidate-0000/source dir cannot leak in.
+    outcomes = PopulationRunState(run_dir).load()
+    if outcomes and outcomes[0].evaluated is not None:
+        return seed_name, outcomes[0].evaluated.source
+    if config.seed_version is None:
+        return seed_name, HarnessSourceTree.from_doc(default_agent(seed_name))
+    try:
+        doc = HarnessStore(root).load(seed_name, str(config.seed_version))
+    except (FileNotFoundError, ValueError) as error:
+        raise typer.BadParameter(
+            f"cannot reload the recorded seed {seed_name}@v{config.seed_version}: {error}"
+        ) from error
+    return seed_name, HarnessSourceTree.from_doc(doc)
+
+
+def _resumed_harbor_config(
+    ctx: typer.Context,
+    config_path: Path,
+    *,
+    name: str,
+    backend: str,
+    e2b_template: str | None,
+    iterations: int | None,
+    harbor_config: str | None,
+    task_ids_file: str | None,
+    attempts: int | None,
+    reward_key: str | None,
+    reward_mode: str | None,
+    harbor_retries: int | None,
+    episode_timeout: float | None,
+    meta_config: ProviderConfig,
+    agent_config: ProviderConfig,
+) -> _HarborRunConfig:
+    """Load the recorded run config, rejecting explicit CLI flags that conflict with it."""
+    if not config_path.is_file():
+        raise typer.BadParameter(
+            f"--resume found no run-config.json under {config_path.parent}; "
+            "start the run once without --resume"
+        )
+    try:
+        stored = _HarborRunConfig.model_validate_json(config_path.read_text(encoding="utf-8"))
+    except ValidationError as error:
+        raise typer.BadParameter(f"cannot load {config_path}: {error}") from error
+
+    conflicts: list[str] = []
+    if name != stored.agent:
+        conflicts.append(f"NAME {name!r} != recorded {stored.agent!r}")
+    checks: list[tuple[str, str, object, object]] = [
+        ("backend", "--backend", backend, stored.backend),
+        ("iterations", "--iterations", iterations, stored.iterations),
+        ("attempts", "--attempts", attempts, stored.attempts),
+        ("reward_key", "--reward-key", reward_key, stored.reward_key),
+        ("reward_mode", "--reward-mode", reward_mode, stored.reward_mode),
+        ("harbor_retries", "--harbor-retries", harbor_retries, stored.harbor_retries),
+        ("episode_timeout", "--episode-timeout", episode_timeout, stored.episode_timeout_s),
+        (
+            "e2b_template",
+            "--e2b-template",
+            resolve_e2b_template(e2b_template),
+            stored.e2b_template,
+        ),
+    ]
+    conflicts.extend(
+        f"{flag} {value!r} != recorded {recorded!r}"
+        for param, flag, value, recorded in checks
+        if _explicit(ctx, param) and value != recorded
+    )
+    if _explicit(ctx, "harbor_config") and harbor_config is not None:
+        template = _load_harbor_job_template(Path(harbor_config))
+        if template != stored.harbor_job_template:
+            conflicts.append("--harbor-config differs from the recorded job template")
+    if _explicit(ctx, "task_ids_file") and task_ids_file is not None:
+        task_ids = _load_harbor_task_ids(Path(task_ids_file))
+        if task_ids != stored.task_ids:
+            conflicts.append("--task-ids differs from the recorded task list")
+    if conflicts:
+        raise typer.BadParameter(
+            "--resume uses the recorded run-config.json; conflicting flag(s): "
+            + "; ".join(conflicts)
+            + ". Drop them to continue this run, or start a fresh --run-dir"
+        )
+    # Provider roles come from settings.toml, not flags, so they are ALWAYS re-checked: a
+    # mid-run settings edit that changes the worker or proposer identity would silently break
+    # cross-slot score comparability.
+    role_changes = [
+        f"settings [models.{role}] resolved to {resolved} but this run recorded {recorded}"
+        for role, resolved, recorded in (
+            ("agent", _model_identity(agent_config), stored.worker_model),
+            ("meta", _model_identity(meta_config), stored.proposer_model),
+        )
+        if resolved != recorded
+    ]
+    if role_changes:
+        raise typer.BadParameter(
+            "; ".join(role_changes) + "; restore the recorded models or start a fresh --run-dir"
+        )
+    return stored
+
+
+def _resolve_harbor_seed(root: str, agent_ref: str) -> tuple[str, HarnessSourceTree, int | None]:
+    """Resolve the seed AGENT positional: literal 'pi' is built-in, otherwise store name@ref.
+
+    The bare literal 'pi' ALWAYS means the built-in default agent (the fixed-seed protocol),
+    even after this command publishes a stored 'pi' champion; compounding runs seed from a
+    stored version explicitly via 'pi@champion' or 'pi@vN'. Returns the publication base name,
+    the seed tree, and the resolved store version (None for the built-in seed) so a resume can
+    pin exactly what this run started from.
+    """
+    base, _, ref = agent_ref.partition("@")
+    try:
+        validate_name(base)
+    except ValueError as error:
+        raise typer.BadParameter(str(error)) from error
+    if base == DEFAULT_SEED_AGENT and not ref:
+        return base, HarnessSourceTree.from_doc(default_agent(base)), None
+    try:
+        doc = HarnessStore(root).load(base, ref or None)
+    except (FileNotFoundError, ValueError) as error:
+        raise typer.BadParameter(
+            f"{error}; the built-in default agent seed is the literal {DEFAULT_SEED_AGENT!r}"
+        ) from error
+    return base, HarnessSourceTree.from_doc(doc), doc.version
+
+
+def _load_harbor_job_template(path: Path) -> JsonObject:
+    """Load one harbor JobConfig template (YAML or JSON) as the PARSED RAW mapping.
+
+    The raw mapping is validated against `JobConfig` for checking only and returned untouched:
+    serializing harbor models redacts sensitive-named env values that differ from this
+    process's environment, so a `model_dump` here would corrupt the recorded run config and
+    every trial's environment. The harbor SDK is an optional extra imported lazily, exactly
+    like the e2b extra: only the harbor environment needs it, and `import wmh` must succeed
+    without it.
+    """
+    try:
+        import yaml
+        from harbor.models.job.config import JobConfig
+    except ImportError as error:
+        raise typer.BadParameter(_HARBOR_EXTRA_HINT) from error
+    try:
+        raw = yaml.safe_load(path.read_text(encoding="utf-8"))
+        JobConfig.model_validate(raw)
+    except (OSError, yaml.YAMLError, ValueError, TypeError) as error:
+        raise typer.BadParameter(f"cannot load the harbor config from {path}: {error}") from error
+    if not isinstance(raw, dict):
+        raise typer.BadParameter(f"the harbor config in {path} must be a mapping")
+    try:
+        normalized = json.loads(json.dumps(raw))
+    except (TypeError, ValueError) as error:
+        raise typer.BadParameter(
+            f"the harbor config in {path} contains values that cannot be recorded as JSON: {error}"
+        ) from error
+    return normalized
+
+
+def _load_harbor_task_ids(path: Path) -> tuple[str, ...]:
+    """Load the exact ordered task-id list, validated by the canonical score request rules."""
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        raise typer.BadParameter(f"cannot load task ids from {path}: {error}") from error
+    if not isinstance(raw, list) or not all(isinstance(item, str) for item in raw):
+        raise typer.BadParameter(f"{path} must contain one JSON array of task-id strings")
+    try:
+        request = ScoreRequest(task_ids=tuple(raw), attempts=1)
+    except ValidationError as error:
+        raise typer.BadParameter(f"invalid task ids in {path}: {error}") from error
+    return request.task_ids
+
+
+def _build_harbor_scorer(
+    config: _HarborRunConfig, *, run_dir: Path, provider_config: ProviderConfig
+) -> tuple[Scorer, JsonObject]:
+    """Construct the harbor evaluator and its resolved per-task provenance pins.
+
+    The harbor import is lazy (optional extra). The pins (git commit / package ref / local
+    path per task id) are recorded in the run config on the first run and re-checked on
+    resume, so a dataset that re-resolves differently is rejected instead of silently scored.
+    """
+    try:
+        from harbor.models.job.config import JobConfig
+
+        from wmh.evals.harbor.scorer import HarborScorer
+    except ImportError as error:
+        raise typer.BadParameter(_HARBOR_EXTRA_HINT) from error
+    template = JobConfig.model_validate(
+        {**config.harbor_job_template, "jobs_dir": str(run_dir / "harbor")}
+    )
+    try:
+        scorer = asyncio.run(
+            HarborScorer.create(
+                template,
+                list(config.task_ids),
+                provider_config=provider_config,
+                reward_key=config.reward_key,
+                reward_mode=config.reward_mode,
+                attempts=config.attempts,
+                task_environment="e2b" if config.backend == "e2b" else "docker",
+                harness_backend=config.backend,
+                # "" pins template absence so the scorer cannot re-read a changed environment.
+                e2b_template=(config.e2b_template or "") if config.backend == "e2b" else None,
+                episode_timeout_s=(
+                    config.episode_timeout_s
+                    if config.backend == "e2b"
+                    else DEFAULT_EVAL_EPISODE_TIMEOUT_S
+                ),
+                harbor_retries=config.harbor_retries,
+            )
+        )
+    except ValueError as error:
+        raise typer.BadParameter(f"cannot build the harbor scorer: {error}") from error
+    return scorer, dict(scorer.task_pins)
+
+
+def _build_harbor_proposer(
+    *, run_dir: Path, meta_config: ProviderConfig, e2b_template: str | None
+) -> CandidateProposer:
+    """Wire the proposer: a fresh E2B project per slot driving the optimizer persona.
+
+    The proposer project requires E2B even under `--backend local` in this version: the
+    optimizer persona needs a contained filesystem plus node for interface validation, and the
+    pi worker template already ships both.
+    """
+    provider = get_provider(meta_config)
+    if not isinstance(provider, ToolCallingProvider):
+        raise typer.BadParameter(
+            "settings [models.meta] provider lacks structured tool calling, which the "
+            "harbor proposer requires"
+        )
+
+    def project_factory() -> CandidateProject:
+        return AgentProject.create(
+            template=e2b_template,
+            metadata={"wmh_component": "optimize-harbor-proposer"},
+        )
+
+    return ProjectCandidateProposer(
+        optimizer_agent(),
+        provider,
+        project_factory=project_factory,
+        run_dir=run_dir,
+    )
 
 
 @harness_app.command("init")
